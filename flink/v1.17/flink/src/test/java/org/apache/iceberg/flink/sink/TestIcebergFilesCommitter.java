@@ -123,6 +123,7 @@ public class TestIcebergFilesCommitter extends TableTestBase {
         .set(DEFAULT_FILE_FORMAT, format.name())
         .set(FLINK_MANIFEST_LOCATION, flinkManifestFolder.getAbsolutePath())
         .set(MAX_CONTINUOUS_EMPTY_COMMITS, "1")
+        .set(SINGLE_PHASE_COMMIT_ENABLED, "false")
         .commit();
   }
 
@@ -160,9 +161,9 @@ public class TestIcebergFilesCommitter extends TableTestBase {
   @Test
   public void testCommitTxnWithoutDataFilesSPC() throws Exception {
     table
-            .updateProperties()
-            .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
-            .commit();
+        .updateProperties()
+        .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+        .commit();
     long checkpointId = 0;
     long timestamp = 0;
     JobID jobId = new JobID();
@@ -265,9 +266,9 @@ public class TestIcebergFilesCommitter extends TableTestBase {
   @Test
   public void testCommitTxnSPC() throws Exception {
     table
-            .updateProperties()
-            .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
-            .commit();
+        .updateProperties()
+        .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+        .commit();
     // Test with 3 continues checkpoints:
     //   1. snapshotState for checkpoint#1
     //   2. notifyCheckpointComplete for checkpoint#1

@@ -159,7 +159,7 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
         maxContinuousEmptyCommits > 0, MAX_CONTINUOUS_EMPTY_COMMITS + " must be positive");
 
     singlePhaseCommitEnabled =
-        PropertyUtil.propertyAsBoolean(table.properties(), SINGLE_PHASE_COMMIT_ENABLED, false);
+        PropertyUtil.propertyAsBoolean(table.properties(), SINGLE_PHASE_COMMIT_ENABLED, true);
 
     int subTaskId = getRuntimeContext().getIndexOfThisSubtask();
     int attemptId = getRuntimeContext().getAttemptNumber();
