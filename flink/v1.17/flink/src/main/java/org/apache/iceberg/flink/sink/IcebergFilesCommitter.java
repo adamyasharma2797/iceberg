@@ -79,6 +79,11 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
   // id will be attached to iceberg's meta when committing the iceberg transaction.
   private static final String MAX_COMMITTED_CHECKPOINT_ID = "flink.max-committed-checkpoint-id";
   static final String MAX_CONTINUOUS_EMPTY_COMMITS = "flink.max-continuous-empty-commits";
+
+  // Table Level Property Flag to enable Single Phase Commit to iceberg table. If enabled,
+  // iceberg will do one single commit in snapshotState only and notifyCheckpointComplete
+  // just skips the commit since commits would be already done in happy path scenarios.
+  // By default, this is enabled, and it can be disabled
   static final String SINGLE_PHASE_COMMIT_ENABLED = "flink.single-phase-commit-enabled";
 
   // TableLoader to load iceberg table lazily.
