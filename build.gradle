@@ -117,7 +117,7 @@ def projectVersion = getProjectVersion()
 final REVAPI_PROJECTS = ["iceberg-api", "iceberg-core", "iceberg-parquet", "iceberg-orc", "iceberg-common", "iceberg-data"]
 
 allprojects {
-  group = "org.apache.iceberg"
+  group = "com.flipkart.fdp.iceberg"
   version = projectVersion
   repositories {
     mavenCentral()
