@@ -57,8 +57,8 @@ import org.junit.rules.TemporaryFolder;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 
-import static org.apache.iceberg.flink.TestFixtures.SECONDARY_TABLE_IDENTIFIER;
-import static org.apache.iceberg.flink.TestFixtures.TABLE_IDENTIFIER;
+import static org.apache.iceberg.flink.TestFixtures.*;
+import static org.apache.iceberg.flink.sink.IcebergMultiTableFilesCommitter.SINGLE_PHASE_COMMIT_ENABLED;
 
 @RunWith(Parameterized.class)
 public class TestFlinkIcebergSink extends TestFlinkIcebergSinkBase {
@@ -72,8 +72,12 @@ public class TestFlinkIcebergSink extends TestFlinkIcebergSinkBase {
   @Rule
   public final HadoopCatalogResource catalogResource =
       new HadoopCatalogResource(TEMPORARY_FOLDER, TestFixtures.DATABASE, TestFixtures.TABLE);
+  @Rule
+  public final HadoopCatalogResource catalogResourceSPC =
+          new HadoopCatalogResource(TEMPORARY_FOLDER, TestFixtures.DATABASE, TestFixtures.TABLE_SPC);
 
   private TableLoader tableLoader;
+  private TableLoader tableLoaderSPC;
 
   private final FileFormat format;
   private final int parallelism;
@@ -86,14 +90,14 @@ public class TestFlinkIcebergSink extends TestFlinkIcebergSinkBase {
       {"avro", 1, false},
       {"avro", 2, true},
       {"avro", 2, false},
-      {"orc", 1, true},
-      {"orc", 1, false},
-      {"orc", 2, true},
-      {"orc", 2, false},
       {"parquet", 1, true},
       {"parquet", 1, false},
       {"parquet", 2, true},
-      {"parquet", 2, false}
+      {"parquet", 2, false},
+      {"orc", 1, true},
+      {"orc", 1, false},
+      {"orc", 2, true},
+      {"orc", 2, false}
     };
   }
 
@@ -114,7 +118,20 @@ public class TestFlinkIcebergSink extends TestFlinkIcebergSinkBase {
                 partitioned
                     ? PartitionSpec.builderFor(SimpleDataUtil.SCHEMA).identity("data").build()
                     : PartitionSpec.unpartitioned(),
-                ImmutableMap.of(TableProperties.DEFAULT_FILE_FORMAT, format.name()));
+                ImmutableMap.of(TableProperties.DEFAULT_FILE_FORMAT, format.name(),
+                        SINGLE_PHASE_COMMIT_ENABLED, "false"));
+
+    tableSPC =
+        catalogResourceSPC
+            .catalog()
+            .createTable(
+                TABLE_SPC_IDENTIFIER,
+                SimpleDataUtil.SCHEMA,
+                partitioned
+                    ? PartitionSpec.builderFor(SimpleDataUtil.SCHEMA).identity("data").build()
+                    : PartitionSpec.unpartitioned(),
+                ImmutableMap.of(TableProperties.DEFAULT_FILE_FORMAT, format.name(),
+                        SINGLE_PHASE_COMMIT_ENABLED, "true"));
 
     table1 = catalogResource
             .catalog()
@@ -124,7 +141,8 @@ public class TestFlinkIcebergSink extends TestFlinkIcebergSinkBase {
                     partitioned
                             ? PartitionSpec.builderFor(SimpleDataUtil.SCHEMA).identity("data").build()
                             : PartitionSpec.unpartitioned(),
-                    ImmutableMap.of(TableProperties.DEFAULT_FILE_FORMAT, format.name()));
+                    ImmutableMap.of(TableProperties.DEFAULT_FILE_FORMAT, format.name(),
+                            SINGLE_PHASE_COMMIT_ENABLED, "false"));
 
     env =
         StreamExecutionEnvironment.getExecutionEnvironment(
@@ -134,6 +152,7 @@ public class TestFlinkIcebergSink extends TestFlinkIcebergSinkBase {
             .setMaxParallelism(parallelism);
 
     tableLoader = catalogResource.tableLoader();
+    tableLoaderSPC = catalogResourceSPC.tableLoader();
   }
 
   @Test
@@ -459,6 +478,26 @@ public class TestFlinkIcebergSink extends TestFlinkIcebergSinkBase {
 
     // Assert the iceberg table's records.
     SimpleDataUtil.assertTableRows(table, convertToRowData(rows));
+  }
+
+  @Test
+  public void testWriteRowWithSinglePhaseCommitEnabled() throws Exception {
+    List<Row> rows = Lists.newArrayList(Row.of(1, "hello"), Row.of(2, "world"), Row.of(3, "foo"));
+    DataStream<RowData> dataStream =
+            env.addSource(createBoundedSource(rows), ROW_TYPE_INFO)
+                    .map(CONVERTER::toInternal, FlinkCompatibilityUtil.toTypeInfo(SimpleDataUtil.ROW_TYPE));
+
+    FlinkSink.forRowData(dataStream)
+            .table(tableSPC)
+            .tableLoader(tableLoaderSPC)
+            .writeParallelism(parallelism)
+            .append();
+
+    // Execute the program.
+    env.execute("Test Iceberg DataStream");
+
+    // Assert the iceberg table's records.
+    SimpleDataUtil.assertTableRows(tableSPC, convertToRowData(rows));
   }
 
   private static class SimpleProvider implements PayloadTableSinkProvider<RowData>, Serializable {

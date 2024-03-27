@@ -43,10 +43,12 @@ public class TestFixtures {
 
   public static final String DATABASE = "default";
   public static final String TABLE = "t";
+  public static final String TABLE_SPC = "t_spc";
   public static final String TABLE_1 = "t1";
   public static final String SINK_TABLE = "t_sink";
 
   public static final TableIdentifier TABLE_IDENTIFIER = TableIdentifier.of(DATABASE, TABLE);
+  public static final TableIdentifier TABLE_SPC_IDENTIFIER = TableIdentifier.of(DATABASE, TABLE_SPC);
   public static final TableIdentifier SECONDARY_TABLE_IDENTIFIER = TableIdentifier.of(DATABASE, TABLE_1);
 
   public static final Schema TS_SCHEMA =

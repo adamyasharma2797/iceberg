@@ -91,6 +91,12 @@ class IcebergMultiTableFilesCommitter extends AbstractStreamOperator<Void>
   private static final String MAX_COMMITTED_CHECKPOINT_ID = "flink.max-committed-checkpoint-id";
   static final String MAX_CONTINUOUS_EMPTY_COMMITS = "flink.max-continuous-empty-commits";
 
+  // Table Level Property Flag to enable Single Phase Commit to iceberg table. If enabled,
+  // iceberg will do one single commit in snapshotState only and notifyCheckpointComplete
+  // just skips the commit since commits would be already done in happy path scenarios.
+  // By default, this is enabled, and it can be disabled
+  static final String SINGLE_PHASE_COMMIT_ENABLED = "flink.single-phase-commit-enabled";
+
   // Since tables are not known in advance and will be discovered while processing each
   // TableAwareWriteResult,
   // Catalog loader is needed to load tables on demand.
@@ -259,6 +265,14 @@ class IcebergMultiTableFilesCommitter extends AbstractStreamOperator<Void>
       if (writeResultsOfCurrentCkpt.containsKey(tableIdentifier)) {
         writeResultsOfCurrentCkpt.get(tableIdentifier).clear();
       }
+
+      boolean singlePhaseCommitEnabled =
+              PropertyUtil.propertyAsBoolean(localTables.get(tableIdentifier).properties(), SINGLE_PHASE_COMMIT_ENABLED,
+                      true);
+      if (singlePhaseCommitEnabled) {
+        LOG.info("Doing single phase commit for table: {}, checkpointId: {}", tableIdentifier, checkpointId);
+        commitCheckpointPerTable(checkpointId, tableIdentifier);
+      }
     }
 
     // Reset the snapshot state to the latest state.
@@ -271,6 +285,17 @@ class IcebergMultiTableFilesCommitter extends AbstractStreamOperator<Void>
   @Override
   public void notifyCheckpointComplete(long checkpointId) throws Exception {
     super.notifyCheckpointComplete(checkpointId);
+
+    localTables.keySet().forEach(ti -> {
+      try {
+        this.commitCheckpointPerTable(checkpointId, ti);
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
+    });
+  }
+
+  private void commitCheckpointPerTable(long checkpointId, TableIdentifier tableIdentifier) throws Exception {
     // It's possible that we have the following events:
     //   1. snapshotState(ckpId);
     //   2. snapshotState(ckpId+1);
@@ -279,37 +304,29 @@ class IcebergMultiTableFilesCommitter extends AbstractStreamOperator<Void>
     // For step#4, we don't need to commit iceberg table again because in step#3 we've committed all
     // the files,
     // Besides, we need to maintain the max-committed-checkpoint-id to be increasing.
-    Iterator<Map.Entry<TableIdentifier, Long>> maxCheckpointIterator =
-        maxCommittedCheckpointId.entrySet().iterator();
-    while (maxCheckpointIterator.hasNext()) {
-      Map.Entry<TableIdentifier, Long> maxCheckpoint = maxCheckpointIterator.next();
-      if (checkpointId > maxCheckpoint.getValue()) {
-        TableIdentifier tableIdentifier = maxCheckpoint.getKey();
+    if(maxCommittedCheckpointId.containsKey(tableIdentifier)) {
+      Long maxCommittedCheckpoint = maxCommittedCheckpointId.get(tableIdentifier);
+      if (checkpointId > maxCommittedCheckpoint) {
         LOG.info("Checkpoint {} completed. Attempting commit.", checkpointId);
         commitUpToCheckpointPerTable(
-            dataFilesPerCheckpoint.get(tableIdentifier),
-            flinkJobId,
-            operatorUniqueId,
-            checkpointId,
-            this.localTables.get(tableIdentifier),
-            tableIdentifier);
+                dataFilesPerCheckpoint.get(tableIdentifier),
+                flinkJobId,
+                operatorUniqueId,
+                checkpointId,
+                this.localTables.get(tableIdentifier),
+                tableIdentifier);
         maxCommittedCheckpointId.put(tableIdentifier, checkpointId);
       } else {
         LOG.info(
-            "Skipping committing checkpoint {}. {} is already committed.",
-            checkpointId,
-            maxCommittedCheckpointId);
+                "Skipping committing checkpoint {}. {} is already committed.",
+                checkpointId,
+                maxCommittedCheckpointId);
       }
     }
-    // reload the table in case new configuration is needed
-    //        this.table = tableLoader.loadTable();
-    Iterator<Map.Entry<TableIdentifier, TableLoader>> tableLoaderIterator =
-        tableLoaders.entrySet().iterator();
-    while (tableLoaderIterator.hasNext()) {
-      Map.Entry<TableIdentifier, TableLoader> tableLoaderEntry = tableLoaderIterator.next();
-      TableIdentifier tableIdentifier = tableLoaderEntry.getKey();
+
+    if(tableLoaders.containsKey(tableIdentifier)) {
       if (localTables.containsKey(tableIdentifier)) {
-        localTables.put(tableIdentifier, tableLoaderEntry.getValue().loadTable());
+        localTables.put(tableIdentifier, tableLoaders.get(tableIdentifier).loadTable());
       }
     }
   }

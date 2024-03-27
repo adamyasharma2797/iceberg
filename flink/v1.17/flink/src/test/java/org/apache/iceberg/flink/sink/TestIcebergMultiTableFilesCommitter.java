@@ -20,6 +20,7 @@ package org.apache.iceberg.flink.sink;
 
 import static org.apache.iceberg.TableProperties.DEFAULT_FILE_FORMAT;
 import static org.apache.iceberg.flink.sink.IcebergFilesCommitter.MAX_CONTINUOUS_EMPTY_COMMITS;
+import static org.apache.iceberg.flink.sink.IcebergFilesCommitter.SINGLE_PHASE_COMMIT_ENABLED;
 import static org.apache.iceberg.flink.sink.ManifestOutputFileFactory.FLINK_MANIFEST_LOCATION;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -93,7 +94,8 @@ import org.mockito.stubbing.Answer;
 public class TestIcebergMultiTableFilesCommitter {
 
   private CatalogLoader catalogLoader;
-  private TableLoader tableLoader;
+  private TableLoader tableLoader1;
+  private TableLoader tableLoader2;
   private MockedStatic<TableLoader> mockStatic = Mockito.mockStatic(TableLoader.class);
 
   private TestTables.TestTable table1;
@@ -154,6 +156,7 @@ public class TestIcebergMultiTableFilesCommitter {
         .set(DEFAULT_FILE_FORMAT, format.name())
         .set(FLINK_MANIFEST_LOCATION, flinkManifestFolder1.getAbsolutePath())
         .set(MAX_CONTINUOUS_EMPTY_COMMITS, "1")
+        .set(SINGLE_PHASE_COMMIT_ENABLED, "false")
         .commit();
 
     flinkManifestFolder2 = temp2.newFolder();
@@ -166,12 +169,17 @@ public class TestIcebergMultiTableFilesCommitter {
         .set(DEFAULT_FILE_FORMAT, format.name())
         .set(FLINK_MANIFEST_LOCATION, flinkManifestFolder2.getAbsolutePath())
         .set(MAX_CONTINUOUS_EMPTY_COMMITS, "1")
+        .set(SINGLE_PHASE_COMMIT_ENABLED, "false")
         .commit();
     catalogLoader = Mockito.mock(CatalogLoader.class);
-    tableLoader = Mockito.mock(TableLoader.class);
+    tableLoader1 = Mockito.mock(TableLoader.class);
+    tableLoader2 = Mockito.mock(TableLoader.class);
     mockStatic
-        .when(() -> TableLoader.fromCatalog(Mockito.any(), Mockito.any()))
-        .thenReturn(tableLoader);
+        .when(() -> TableLoader.fromCatalog(Mockito.any(), Mockito.eq(TableIdentifier.of("dummy", "table1"))))
+        .thenReturn(tableLoader1);
+    mockStatic
+            .when(() -> TableLoader.fromCatalog(Mockito.any(), Mockito.eq(TableIdentifier.of("dummy", "table2"))))
+            .thenReturn(tableLoader2);
   }
 
   @After
@@ -187,7 +195,8 @@ public class TestIcebergMultiTableFilesCommitter {
     OperatorID operatorId;
     try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
         createStreamSink(jobId)) {
-      Mockito.when(tableLoader.loadTable()).thenReturn(table1).thenReturn(table2);
+      Mockito.when(tableLoader1.loadTable()).thenReturn(table1);
+      Mockito.when(tableLoader2.loadTable()).thenReturn(table2);
       harness.setup();
       harness.open();
       operatorId = harness.getOperator().getOperatorID();
@@ -215,7 +224,115 @@ public class TestIcebergMultiTableFilesCommitter {
         // snapshot commit will happen
         assertSnapshotSize(table1, 0);
         assertSnapshotSize(table2, 0);
-        // This is -1 because checkpoint will not move ahead since table disovery happens only
+        // This is -1 because checkpoint will not move ahead since table discovery happens only
+        // during process elements
+        assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1);
+        assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1);
+      }
+    }
+  }
+
+  @Test
+  public void testCommitTxnWithoutDataFilesBothTablesSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+
+    long checkpointId = 0;
+    long timestamp = 0;
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      Mockito.when(tableLoader1.loadTable()).thenReturn(table1);
+      Mockito.when(tableLoader2.loadTable()).thenReturn(table2);
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      SimpleDataUtil.assertTableRows(table1, Lists.newArrayList(), branch);
+      SimpleDataUtil.assertTableRows(table2, Lists.newArrayList(), branch);
+      assertSnapshotSize(table1, 0);
+      assertSnapshotSize(table2, 0);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      // It's better to advance the max-committed-checkpoint-id in iceberg snapshot, so that the
+      // future flink job
+      // failover won't fail.
+      for (int i = 1; i <= 3; i++) {
+        harness.snapshot(++checkpointId, ++timestamp);
+        assertFlinkManifests(0, flinkManifestFolder1);
+        assertFlinkManifests(0, flinkManifestFolder2);
+
+        harness.notifyOfCompletedCheckpoint(checkpointId);
+        assertFlinkManifests(0, flinkManifestFolder1);
+        assertFlinkManifests(0, flinkManifestFolder2);
+
+        // This is 0 because table will be identified only after process element. Till then, no
+        // snapshot commit will happen
+        assertSnapshotSize(table1, 0);
+        assertSnapshotSize(table2, 0);
+        // This is -1 because checkpoint will not move ahead since table discovery happens only
+        // during process elements
+        assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1);
+        assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1);
+      }
+    }
+  }
+
+  @Test
+  public void testCommitTxnWithoutDataFilesOneTableSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "false")
+      .commit();
+
+    long checkpointId = 0;
+    long timestamp = 0;
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      Mockito.when(tableLoader1.loadTable()).thenReturn(table1);
+      Mockito.when(tableLoader2.loadTable()).thenReturn(table2);
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      SimpleDataUtil.assertTableRows(table1, Lists.newArrayList(), branch);
+      SimpleDataUtil.assertTableRows(table2, Lists.newArrayList(), branch);
+      assertSnapshotSize(table1, 0);
+      assertSnapshotSize(table2, 0);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      // It's better to advance the max-committed-checkpoint-id in iceberg snapshot, so that the
+      // future flink job
+      // failover won't fail.
+      for (int i = 1; i <= 3; i++) {
+        harness.snapshot(++checkpointId, ++timestamp);
+        assertFlinkManifests(0, flinkManifestFolder1);
+        assertFlinkManifests(0, flinkManifestFolder2);
+
+        harness.notifyOfCompletedCheckpoint(checkpointId);
+        assertFlinkManifests(0, flinkManifestFolder1);
+        assertFlinkManifests(0, flinkManifestFolder2);
+
+        // This is 0 because table will be identified only after process element. Till then, no
+        // snapshot commit will happen
+        assertSnapshotSize(table1, 0);
+        assertSnapshotSize(table2, 0);
+        // This is -1 because checkpoint will not move ahead since table discovery happens only
         // during process elements
         assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1);
         assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1);
@@ -250,7 +367,7 @@ public class TestIcebergMultiTableFilesCommitter {
     OperatorID operatorId;
     try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
         createStreamSink(jobID)) {
-      Mockito.when(tableLoader.loadTable()).thenReturn(table1);
+      Mockito.when(tableLoader1.loadTable()).thenReturn(table1);
       harness.setup();
       harness.open();
       operatorId = harness.getOperator().getOperatorID();
@@ -276,6 +393,55 @@ public class TestIcebergMultiTableFilesCommitter {
         Assert.assertEquals(
             TestIcebergMultiTableFilesCommitter.class.getName(),
             SimpleDataUtil.latestSnapshot(table1, branch).summary().get("flink.test"));
+      }
+    }
+  }
+
+  @Test
+  public void testWriteToOneTableSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    // Test with 3 continues checkpoints:
+    //   1. snapshotState for checkpoint#1
+    //   2. notifyCheckpointComplete for checkpoint#1
+    //   3. snapshotState for checkpoint#2
+    //   4. notifyCheckpointComplete for checkpoint#2
+    //   5. snapshotState for checkpoint#3
+    //   6. notifyCheckpointComplete for checkpoint#3
+    long timestamp = 0;
+
+    JobID jobID = new JobID();
+    OperatorID operatorId;
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobID)) {
+      Mockito.when(tableLoader1.loadTable()).thenReturn(table1);
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertSnapshotSize(table1, 0);
+
+      List<RowData> rows = Lists.newArrayListWithExpectedSize(3);
+      for (int i = 1; i <= 3; i++) {
+        RowData rowData = SimpleDataUtil.createRowData(i, "hello" + i);
+        DataFile dataFile = writeDataFile(table1, "data-" + i, ImmutableList.of(rowData));
+        harness.processElement(of(dataFile, table1.name()), ++timestamp);
+        rows.add(rowData);
+
+        harness.snapshot(i, ++timestamp);
+        assertFlinkManifests(0, flinkManifestFolder1);
+
+        harness.notifyOfCompletedCheckpoint(i);
+        assertFlinkManifests(0, flinkManifestFolder1);
+
+        SimpleDataUtil.assertTableRows(table1, ImmutableList.copyOf(rows), branch);
+        assertSnapshotSize(table1, i);
+        assertMaxCommittedCheckpointId(table1, jobID, operatorId, i);
+        Assert.assertEquals(
+                TestIcebergMultiTableFilesCommitter.class.getName(),
+                SimpleDataUtil.latestSnapshot(table1, branch).summary().get("flink.test"));
       }
     }
   }
@@ -336,6 +502,132 @@ public class TestIcebergMultiTableFilesCommitter {
   }
 
   @Test
+  public void testWrite2TablesBothSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    // Test with 3 continues checkpoints:
+    //   1. snapshotState for checkpoint#1
+    //   2. notifyCheckpointComplete for checkpoint#1
+    //   3. snapshotState for checkpoint#2
+    //   4. notifyCheckpointComplete for checkpoint#2
+    //   5. snapshotState for checkpoint#3
+    //   6. notifyCheckpointComplete for checkpoint#3
+    long timestamp = 0;
+    JobID jobID = new JobID();
+    OperatorID operatorId;
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobID)) {
+      createAlternateTableMock();
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertSnapshotSize(table1, 0);
+      assertSnapshotSize(table2, 0);
+
+      List<RowData> rows = Lists.newArrayListWithExpectedSize(3);
+      for (int i = 1; i <= 3; i++) {
+        RowData rowData = SimpleDataUtil.createRowData(i, "hello" + i);
+        DataFile dataFile1 = writeDataFile(table1, "data-table1" + i, ImmutableList.of(rowData));
+        DataFile dataFile2 = writeDataFile(table2, "data-table2" + i, ImmutableList.of(rowData));
+        harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+        harness.processElement(of(dataFile2, table2.name()), timestamp);
+        rows.add(rowData);
+
+        harness.snapshot(i, ++timestamp);
+        assertFlinkManifests(0, flinkManifestFolder1);
+        assertFlinkManifests(0, flinkManifestFolder2);
+
+        harness.notifyOfCompletedCheckpoint(i);
+        assertFlinkManifests(0, flinkManifestFolder1);
+        assertFlinkManifests(0, flinkManifestFolder2);
+
+        SimpleDataUtil.assertTableRows(table1, ImmutableList.copyOf(rows), branch);
+        SimpleDataUtil.assertTableRows(table2, ImmutableList.copyOf(rows), branch);
+        assertSnapshotSize(table1, i);
+        assertSnapshotSize(table2, i);
+        assertMaxCommittedCheckpointId(table1, jobID, operatorId, i);
+        assertMaxCommittedCheckpointId(table2, jobID, operatorId, i);
+        Assert.assertEquals(
+                TestIcebergMultiTableFilesCommitter.class.getName(),
+                SimpleDataUtil.latestSnapshot(table1, branch).summary().get("flink.test"));
+        Assert.assertEquals(
+                TestIcebergMultiTableFilesCommitter.class.getName(),
+                SimpleDataUtil.latestSnapshot(table2, branch).summary().get("flink.test"));
+      }
+    }
+  }
+
+  @Test
+  public void testWrite2TablesOneSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "false")
+      .commit();
+    // Test with 3 continuous checkpoints:
+    //   1. snapshotState for checkpoint#1
+    //   2. notifyCheckpointComplete for checkpoint#1
+    //   3. snapshotState for checkpoint#2
+    //   4. notifyCheckpointComplete for checkpoint#2
+    //   5. snapshotState for checkpoint#3
+    //   6. notifyCheckpointComplete for checkpoint#3
+    long timestamp = 0;
+    JobID jobID = new JobID();
+    OperatorID operatorId;
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobID)) {
+      createAlternateTableMock();
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertSnapshotSize(table1, 0);
+      assertSnapshotSize(table2, 0);
+
+      List<RowData> rows = Lists.newArrayListWithExpectedSize(3);
+      for (int i = 1; i <= 3; i++) {
+        RowData rowData = SimpleDataUtil.createRowData(i, "hello" + i);
+        DataFile dataFile1 = writeDataFile(table1, "data-table1" + i, ImmutableList.of(rowData));
+        DataFile dataFile2 = writeDataFile(table2, "data-table2" + i, ImmutableList.of(rowData));
+        harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+        harness.processElement(of(dataFile2, table2.name()), timestamp);
+        rows.add(rowData);
+
+        harness.snapshot(i, ++timestamp);
+        assertFlinkManifests(0, flinkManifestFolder1);
+        assertFlinkManifests(1, flinkManifestFolder2);
+
+        harness.notifyOfCompletedCheckpoint(i);
+        assertFlinkManifests(0, flinkManifestFolder1);
+        assertFlinkManifests(0, flinkManifestFolder2);
+
+        SimpleDataUtil.assertTableRows(table1, ImmutableList.copyOf(rows), branch);
+        SimpleDataUtil.assertTableRows(table2, ImmutableList.copyOf(rows), branch);
+        assertSnapshotSize(table1, i);
+        assertSnapshotSize(table2, i);
+        assertMaxCommittedCheckpointId(table1, jobID, operatorId, i);
+        assertMaxCommittedCheckpointId(table2, jobID, operatorId, i);
+        Assert.assertEquals(
+                TestIcebergMultiTableFilesCommitter.class.getName(),
+                SimpleDataUtil.latestSnapshot(table1, branch).summary().get("flink.test"));
+        Assert.assertEquals(
+                TestIcebergMultiTableFilesCommitter.class.getName(),
+                SimpleDataUtil.latestSnapshot(table2, branch).summary().get("flink.test"));
+      }
+    }
+  }
+
+  @Test
   public void testMaxContinuousEmptyCommits() throws Exception {
     table1.updateProperties().set(MAX_CONTINUOUS_EMPTY_COMMITS, "3").commit();
     table2.updateProperties().set(MAX_CONTINUOUS_EMPTY_COMMITS, "2").commit();
@@ -345,6 +637,102 @@ public class TestIcebergMultiTableFilesCommitter {
     long timestamp = 0;
     try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
         createStreamSink(jobId)) {
+      createAlternateTableMock();
+      harness.setup();
+      harness.open();
+
+      assertSnapshotSize(table1, 0);
+      assertSnapshotSize(table2, 0);
+
+      for (int i = 1; i <= 9; i++) {
+        harness.snapshot(++checkpointId, ++timestamp);
+        harness.notifyOfCompletedCheckpoint(checkpointId);
+        assertSnapshotSize(table1, 0);
+        assertSnapshotSize(table2, 0);
+      }
+      RowData rowData = SimpleDataUtil.createRowData(0, "hello" + 0);
+      DataFile dataFile1 = writeDataFile(table1, "data-table1" + 0, ImmutableList.of(rowData));
+      DataFile dataFile2 = writeDataFile(table2, "data-table2" + 0, ImmutableList.of(rowData));
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), timestamp);
+      harness.snapshot(++checkpointId, ++timestamp);
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      for (int i = 1; i <= 9; i++) {
+        harness.snapshot(++checkpointId, ++timestamp);
+        harness.notifyOfCompletedCheckpoint(checkpointId);
+        assertSnapshotSize(table1, 1 + (i / 3));
+        assertSnapshotSize(table2, 1 + (i / 2));
+      }
+    }
+  }
+
+  @Test
+  public void testMaxContinuousEmptyCommitsBothSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+
+    table1.updateProperties().set(MAX_CONTINUOUS_EMPTY_COMMITS, "3").commit();
+    table2.updateProperties().set(MAX_CONTINUOUS_EMPTY_COMMITS, "2").commit();
+
+    JobID jobId = new JobID();
+    long checkpointId = 0;
+    long timestamp = 0;
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      createAlternateTableMock();
+      harness.setup();
+      harness.open();
+
+      assertSnapshotSize(table1, 0);
+      assertSnapshotSize(table2, 0);
+
+      for (int i = 1; i <= 9; i++) {
+        harness.snapshot(++checkpointId, ++timestamp);
+        harness.notifyOfCompletedCheckpoint(checkpointId);
+        assertSnapshotSize(table1, 0);
+        assertSnapshotSize(table2, 0);
+      }
+      RowData rowData = SimpleDataUtil.createRowData(0, "hello" + 0);
+      DataFile dataFile1 = writeDataFile(table1, "data-table1" + 0, ImmutableList.of(rowData));
+      DataFile dataFile2 = writeDataFile(table2, "data-table2" + 0, ImmutableList.of(rowData));
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), timestamp);
+      harness.snapshot(++checkpointId, ++timestamp);
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      for (int i = 1; i <= 9; i++) {
+        harness.snapshot(++checkpointId, ++timestamp);
+        harness.notifyOfCompletedCheckpoint(checkpointId);
+        assertSnapshotSize(table1, 1 + (i / 3));
+        assertSnapshotSize(table2, 1 + (i / 2));
+      }
+    }
+  }
+
+  @Test
+  public void testMaxContinuousEmptyCommitsOneSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "false")
+      .commit();
+
+    table1.updateProperties().set(MAX_CONTINUOUS_EMPTY_COMMITS, "3").commit();
+    table2.updateProperties().set(MAX_CONTINUOUS_EMPTY_COMMITS, "2").commit();
+
+    JobID jobId = new JobID();
+    long checkpointId = 0;
+    long timestamp = 0;
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
       createAlternateTableMock();
       harness.setup();
       harness.open();
@@ -445,6 +833,164 @@ public class TestIcebergMultiTableFilesCommitter {
   }
 
   @Test
+  public void testOrderedEventsBetweenCheckpointsBothSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+
+    // It's possible that two checkpoints happen in the following orders:
+    //   1. snapshotState for checkpoint#1;
+    //   2. snapshotState for checkpoint#2;
+    //   3. notifyCheckpointComplete for checkpoint#1;
+    //   4. notifyCheckpointComplete for checkpoint#2;
+    long timestamp = 0;
+
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      createAlternateTableMock();
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      RowData row1 = SimpleDataUtil.createRowData(1, "hello");
+      DataFile dataFile1 = writeDataFile(table1, "data-1", ImmutableList.of(row1));
+      DataFile dataFile2 = writeDataFile(table2, "data-1", ImmutableList.of(row1));
+
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      // 1. snapshotState for checkpoint#1
+      long firstCheckpointId = 1;
+      harness.snapshot(firstCheckpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      RowData row2 = SimpleDataUtil.createRowData(2, "world");
+      DataFile dataFile3 = writeDataFile(table1, "data-2", ImmutableList.of(row2));
+      DataFile dataFile4 = writeDataFile(table2, "data-2", ImmutableList.of(row2));
+      harness.processElement(of(dataFile3, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile4, table2.name()), ++timestamp);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, firstCheckpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, firstCheckpointId);
+
+      // 2. snapshotState for checkpoint#2
+      long secondCheckpointId = 2;
+      harness.snapshot(secondCheckpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      // 3. notifyCheckpointComplete for checkpoint#1
+      harness.notifyOfCompletedCheckpoint(firstCheckpointId);
+      SimpleDataUtil.assertTableRows(table1, ImmutableList.of(row1, row2), branch);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(row1, row2), branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, secondCheckpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, secondCheckpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      // 4. notifyCheckpointComplete for checkpoint#2
+      harness.notifyOfCompletedCheckpoint(secondCheckpointId);
+      SimpleDataUtil.assertTableRows(table1, ImmutableList.of(row1, row2), branch);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(row1, row2), branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, secondCheckpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, secondCheckpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+    }
+  }
+
+  @Test
+  public void testOrderedEventsBetweenCheckpointsOneSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "false")
+      .commit();
+
+    // It's possible that two checkpoints happen in the following orders:
+    //   1. snapshotState for checkpoint#1;
+    //   2. snapshotState for checkpoint#2;
+    //   3. notifyCheckpointComplete for checkpoint#1;
+    //   4. notifyCheckpointComplete for checkpoint#2;
+    long timestamp = 0;
+
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      createAlternateTableMock();
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      RowData row1 = SimpleDataUtil.createRowData(1, "hello");
+      DataFile dataFile1 = writeDataFile(table1, "data-1", ImmutableList.of(row1));
+      DataFile dataFile2 = writeDataFile(table2, "data-1", ImmutableList.of(row1));
+
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      // 1. snapshotState for checkpoint#1
+      long firstCheckpointId = 1;
+      harness.snapshot(firstCheckpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(1, flinkManifestFolder2);
+
+      RowData row2 = SimpleDataUtil.createRowData(2, "world");
+      DataFile dataFile3 = writeDataFile(table1, "data-2", ImmutableList.of(row2));
+      DataFile dataFile4 = writeDataFile(table2, "data-2", ImmutableList.of(row2));
+      harness.processElement(of(dataFile3, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile4, table2.name()), ++timestamp);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, firstCheckpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      // 2. snapshotState for checkpoint#2
+      long secondCheckpointId = 2;
+      harness.snapshot(secondCheckpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(2, flinkManifestFolder2);
+
+      // 3. notifyCheckpointComplete for checkpoint#1
+      harness.notifyOfCompletedCheckpoint(firstCheckpointId);
+      SimpleDataUtil.assertTableRows(table1, ImmutableList.of(row1, row2), branch);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(row1), branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, secondCheckpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, firstCheckpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(1, flinkManifestFolder2);
+
+      // 4. notifyCheckpointComplete for checkpoint#2
+      harness.notifyOfCompletedCheckpoint(secondCheckpointId);
+      SimpleDataUtil.assertTableRows(table1, ImmutableList.of(row1, row2), branch);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(row1, row2), branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, secondCheckpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, secondCheckpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+    }
+  }
+
+  @Test
   public void testDisorderedEventsBetweenCheckpoints() throws Exception {
     // It's possible that the two checkpoints happen in the following orders:
     //   1. snapshotState for checkpoint#1;
@@ -492,6 +1038,164 @@ public class TestIcebergMultiTableFilesCommitter {
       long secondCheckpointId = 2;
       harness.snapshot(secondCheckpointId, ++timestamp);
       assertFlinkManifests(2, flinkManifestFolder1);
+      assertFlinkManifests(2, flinkManifestFolder2);
+
+      // 3. notifyCheckpointComplete for checkpoint#2
+      harness.notifyOfCompletedCheckpoint(secondCheckpointId);
+      SimpleDataUtil.assertTableRows(table1, ImmutableList.of(row1, row2), branch);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(row1, row2), branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, secondCheckpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, secondCheckpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      // 4. notifyCheckpointComplete for checkpoint#1
+      harness.notifyOfCompletedCheckpoint(firstCheckpointId);
+      SimpleDataUtil.assertTableRows(table1, ImmutableList.of(row1, row2), branch);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(row1, row2), branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, secondCheckpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, secondCheckpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+    }
+  }
+
+  @Test
+  public void testDisorderedEventsBetweenCheckpointsBothSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+
+    // It's possible that the two checkpoints happen in the following orders:
+    //   1. snapshotState for checkpoint#1;
+    //   2. snapshotState for checkpoint#2;
+    //   3. notifyCheckpointComplete for checkpoint#2;
+    //   4. notifyCheckpointComplete for checkpoint#1;
+    long timestamp = 0;
+
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      createAlternateTableMock();
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      RowData row1 = SimpleDataUtil.createRowData(1, "hello");
+      DataFile dataFile1 = writeDataFile(table1, "data-1", ImmutableList.of(row1));
+      DataFile dataFile2 = writeDataFile(table2, "data-1", ImmutableList.of(row1));
+
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      // 1. snapshotState for checkpoint#1
+      long firstCheckpointId = 1;
+      harness.snapshot(firstCheckpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      RowData row2 = SimpleDataUtil.createRowData(2, "world");
+      DataFile dataFile3 = writeDataFile(table1, "data-2", ImmutableList.of(row2));
+      DataFile dataFile4 = writeDataFile(table2, "data-2", ImmutableList.of(row2));
+      harness.processElement(of(dataFile3, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile4, table2.name()), ++timestamp);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, firstCheckpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, firstCheckpointId);
+
+      // 2. snapshotState for checkpoint#2
+      long secondCheckpointId = 2;
+      harness.snapshot(secondCheckpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      // 3. notifyCheckpointComplete for checkpoint#2
+      harness.notifyOfCompletedCheckpoint(secondCheckpointId);
+      SimpleDataUtil.assertTableRows(table1, ImmutableList.of(row1, row2), branch);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(row1, row2), branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, secondCheckpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, secondCheckpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      // 4. notifyCheckpointComplete for checkpoint#1
+      harness.notifyOfCompletedCheckpoint(firstCheckpointId);
+      SimpleDataUtil.assertTableRows(table1, ImmutableList.of(row1, row2), branch);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(row1, row2), branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, secondCheckpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, secondCheckpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+    }
+  }
+
+  @Test
+  public void testDisorderedEventsBetweenCheckpointsOneSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "false")
+      .commit();
+
+    // It's possible that the two checkpoints happen in the following orders:
+    //   1. snapshotState for checkpoint#1;
+    //   2. snapshotState for checkpoint#2;
+    //   3. notifyCheckpointComplete for checkpoint#2;
+    //   4. notifyCheckpointComplete for checkpoint#1;
+    long timestamp = 0;
+
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      createAlternateTableMock();
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      RowData row1 = SimpleDataUtil.createRowData(1, "hello");
+      DataFile dataFile1 = writeDataFile(table1, "data-1", ImmutableList.of(row1));
+      DataFile dataFile2 = writeDataFile(table2, "data-1", ImmutableList.of(row1));
+
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      // 1. snapshotState for checkpoint#1
+      long firstCheckpointId = 1;
+      harness.snapshot(firstCheckpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(1, flinkManifestFolder2);
+
+      RowData row2 = SimpleDataUtil.createRowData(2, "world");
+      DataFile dataFile3 = writeDataFile(table1, "data-2", ImmutableList.of(row2));
+      DataFile dataFile4 = writeDataFile(table2, "data-2", ImmutableList.of(row2));
+      harness.processElement(of(dataFile3, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile4, table2.name()), ++timestamp);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, firstCheckpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      // 2. snapshotState for checkpoint#2
+      long secondCheckpointId = 2;
+      harness.snapshot(secondCheckpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
       assertFlinkManifests(2, flinkManifestFolder2);
 
       // 3. notifyCheckpointComplete for checkpoint#2
@@ -582,6 +1286,190 @@ public class TestIcebergMultiTableFilesCommitter {
 
       harness.snapshot(++checkpointId, ++timestamp);
       assertFlinkManifests(1, flinkManifestFolder1);
+      assertFlinkManifests(1, flinkManifestFolder2);
+
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, expectedRows, branch);
+      assertSnapshotSize(table1, 2);
+      assertSnapshotSize(table2, 2);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId);
+    }
+  }
+
+  @Test
+  public void testRecoveryFromValidSnapshotBothSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+
+    long checkpointId = 0;
+    long timestamp = 0;
+    List<RowData> expectedRows = Lists.newArrayList();
+    OperatorSubtaskState snapshot;
+
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    createAlternateTableMock();
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertSnapshotSize(table1, 0);
+      assertSnapshotSize(table2, 0);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      RowData row = SimpleDataUtil.createRowData(1, "hello");
+      expectedRows.add(row);
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-1", ImmutableList.of(row));
+      DataFile dataFile2 = writeDataFile(table2, "data-table2-1", ImmutableList.of(row));
+
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+      snapshot = harness.snapshot(++checkpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, ImmutableList.of(row), branch);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(row), branch);
+      assertSnapshotSize(table1, 1);
+      assertSnapshotSize(table2, 1);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId);
+    }
+
+    // Restore from the given snapshot
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.getStreamConfig().setOperatorID(operatorId);
+      harness.setup();
+      harness.initializeState(snapshot);
+      harness.open();
+
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, expectedRows, branch);
+      assertSnapshotSize(table1, 1);
+      assertSnapshotSize(table2, 1);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId);
+
+      RowData row = SimpleDataUtil.createRowData(2, "world");
+      expectedRows.add(row);
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-2", ImmutableList.of(row));
+      DataFile dataFile2 = writeDataFile(table1, "data-table2-2", ImmutableList.of(row));
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+
+      harness.snapshot(++checkpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, expectedRows, branch);
+      assertSnapshotSize(table1, 2);
+      assertSnapshotSize(table2, 2);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId);
+    }
+  }
+
+  @Test
+  public void testRecoveryFromValidSnapshotOneSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "false")
+      .commit();
+
+    long checkpointId = 0;
+    long timestamp = 0;
+    List<RowData> expectedRows = Lists.newArrayList();
+    OperatorSubtaskState snapshot;
+
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    createAlternateTableMock();
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertSnapshotSize(table1, 0);
+      assertSnapshotSize(table2, 0);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      RowData row = SimpleDataUtil.createRowData(1, "hello");
+      expectedRows.add(row);
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-1", ImmutableList.of(row));
+      DataFile dataFile2 = writeDataFile(table2, "data-table2-1", ImmutableList.of(row));
+
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+      snapshot = harness.snapshot(++checkpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(1, flinkManifestFolder2);
+
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, ImmutableList.of(row), branch);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(row), branch);
+      assertSnapshotSize(table1, 1);
+      assertSnapshotSize(table2, 1);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId);
+    }
+
+    // Restore from the given snapshot
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.getStreamConfig().setOperatorID(operatorId);
+      harness.setup();
+      harness.initializeState(snapshot);
+      harness.open();
+
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, expectedRows, branch);
+      assertSnapshotSize(table1, 1);
+      assertSnapshotSize(table2, 1);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId);
+
+      RowData row = SimpleDataUtil.createRowData(2, "world");
+      expectedRows.add(row);
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-2", ImmutableList.of(row));
+      DataFile dataFile2 = writeDataFile(table1, "data-table2-2", ImmutableList.of(row));
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+
+      harness.snapshot(++checkpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
       assertFlinkManifests(1, flinkManifestFolder2);
 
       harness.notifyOfCompletedCheckpoint(checkpointId);
@@ -729,6 +1617,297 @@ public class TestIcebergMultiTableFilesCommitter {
   }
 
   @Test
+  public void testRecoveryFromSnapshotWithoutCompletedNotificationBothSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+
+    // We've two steps in checkpoint: 1. snapshotState(ckp); 2. notifyCheckpointComplete(ckp). It's
+    // possible that we
+    // flink job will restore from a checkpoint with only step#1 finished.
+    long checkpointId = 0;
+    long timestamp = 0;
+    OperatorSubtaskState snapshot;
+    List<RowData> expectedRows = Lists.newArrayList();
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    createAlternateTableMock();
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertSnapshotSize(table1, 0);
+      assertSnapshotSize(table2, 0);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      RowData row = SimpleDataUtil.createRowData(1, "hello");
+      expectedRows.add(row);
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-1", ImmutableList.of(row));
+      DataFile dataFile2 = writeDataFile(table2, "data-table2-1", ImmutableList.of(row));
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+
+      snapshot = harness.snapshot(++checkpointId, ++timestamp);
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, expectedRows, branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+    }
+
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.getStreamConfig().setOperatorID(operatorId);
+      harness.setup();
+      harness.initializeState(snapshot);
+      harness.open();
+
+      // All flink manifests should be cleaned because it has committed the unfinished iceberg
+      // transaction.
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, expectedRows, branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId);
+
+      harness.snapshot(++checkpointId, ++timestamp);
+      // Did not write any new record, so it won't generate new manifest.
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, expectedRows, branch);
+      assertSnapshotSize(table1, 2);
+      assertSnapshotSize(table2, 2);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId);
+
+      RowData row = SimpleDataUtil.createRowData(2, "world");
+      expectedRows.add(row);
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-2", ImmutableList.of(row));
+      DataFile dataFile2 = writeDataFile(table2, "data-table2-2", ImmutableList.of(row));
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+
+      snapshot = harness.snapshot(++checkpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+    }
+
+    // Redeploying flink job from external checkpoint.
+    JobID newJobId = new JobID();
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(newJobId)) {
+      harness.setup();
+      harness.initializeState(snapshot);
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      // All flink manifests should be cleaned because it has committed the unfinished iceberg
+      // transaction.
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      assertMaxCommittedCheckpointId(table1, newJobId, operatorId, -1);
+      assertMaxCommittedCheckpointId(table2, newJobId, operatorId, -1);
+
+      //In normal scenario, this would be not -1, but with SPC, all the commits happened in oldJob
+      //and with old operatorId, so it will be -1, without SPC, during initialize commit will happen
+      //which will use old jobId but new operatorId
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1);
+
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, expectedRows, branch);
+      assertSnapshotSize(table1, 3);
+      assertSnapshotSize(table2, 3);
+
+      RowData row = SimpleDataUtil.createRowData(3, "foo");
+      expectedRows.add(row);
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-3", ImmutableList.of(row));
+      DataFile dataFile2 = writeDataFile(table2, "data-table2-3", ImmutableList.of(row));
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+
+      harness.snapshot(++checkpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, expectedRows, branch);
+      assertSnapshotSize(table1, 4);
+      assertSnapshotSize(table2, 4);
+      assertMaxCommittedCheckpointId(table1, newJobId, operatorId, checkpointId);
+      assertMaxCommittedCheckpointId(table2, newJobId, operatorId, checkpointId);
+    }
+  }
+
+  @Test
+  public void testRecoveryFromSnapshotWithoutCompletedNotificationOneSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "false")
+      .commit();
+
+    // We've two steps in checkpoint: 1. snapshotState(ckp); 2. notifyCheckpointComplete(ckp). It's
+    // possible that we
+    // flink job will restore from a checkpoint with only step#1 finished.
+    long checkpointId = 0;
+    long timestamp = 0;
+    OperatorSubtaskState snapshot;
+    List<RowData> expectedRows = Lists.newArrayList();
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    createAlternateTableMock();
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertSnapshotSize(table1, 0);
+      assertSnapshotSize(table2, 0);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      RowData row = SimpleDataUtil.createRowData(1, "hello");
+      expectedRows.add(row);
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-1", ImmutableList.of(row));
+      DataFile dataFile2 = writeDataFile(table2, "data-table2-1", ImmutableList.of(row));
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+
+      snapshot = harness.snapshot(++checkpointId, ++timestamp);
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(), branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(1, flinkManifestFolder2);
+    }
+
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.getStreamConfig().setOperatorID(operatorId);
+      harness.setup();
+      harness.initializeState(snapshot);
+      harness.open();
+
+      // All flink manifests should be cleaned because it has committed the unfinished iceberg
+      // transaction.
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, expectedRows, branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId);
+
+      harness.snapshot(++checkpointId, ++timestamp);
+      // Did not write any new record, so it won't generate new manifest.
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, expectedRows, branch);
+      assertSnapshotSize(table1, 2);
+      assertSnapshotSize(table2, 2);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId);
+
+      RowData row = SimpleDataUtil.createRowData(2, "world");
+      expectedRows.add(row);
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-2", ImmutableList.of(row));
+      DataFile dataFile2 = writeDataFile(table2, "data-table2-2", ImmutableList.of(row));
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+
+      snapshot = harness.snapshot(++checkpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(1, flinkManifestFolder2);
+    }
+
+    // Redeploying flink job from external checkpoint.
+    JobID newJobId = new JobID();
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(newJobId)) {
+      harness.setup();
+      harness.initializeState(snapshot);
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      // All flink manifests should be cleaned because it has committed the unfinished iceberg
+      // transaction.
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      assertMaxCommittedCheckpointId(table1, newJobId, operatorId, -1);
+      assertMaxCommittedCheckpointId(table2, newJobId, operatorId, -1);
+
+      //In normal scenario, this would be not -1, but with SPC, all the commits happened in oldJob
+      //and with old operatorId, so it will be -1, without SPC, during initialize commit will happen
+      //which will use old jobId but new operatorId
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1);
+
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId);
+
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, expectedRows, branch);
+      assertSnapshotSize(table1, 3);
+      assertSnapshotSize(table2, 3);
+
+      RowData row = SimpleDataUtil.createRowData(3, "foo");
+      expectedRows.add(row);
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-3", ImmutableList.of(row));
+      DataFile dataFile2 = writeDataFile(table2, "data-table2-3", ImmutableList.of(row));
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+
+      harness.snapshot(++checkpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(1, flinkManifestFolder2);
+
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, expectedRows, branch);
+      assertSnapshotSize(table1, 4);
+      assertSnapshotSize(table2, 4);
+      assertMaxCommittedCheckpointId(table1, newJobId, operatorId, checkpointId);
+      assertMaxCommittedCheckpointId(table2, newJobId, operatorId, checkpointId);
+    }
+  }
+
+  @Test
   public void testStartAnotherJobToWriteSameTable() throws Exception {
     long checkpointId = 0;
     long timestamp = 0;
@@ -816,6 +1995,198 @@ public class TestIcebergMultiTableFilesCommitter {
   }
 
   @Test
+  public void testStartAnotherJobToWriteSameTableBothSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+
+    long checkpointId = 0;
+    long timestamp = 0;
+    List<RowData> rows = Lists.newArrayList();
+    List<RowData> tableRows = Lists.newArrayList();
+
+    JobID oldJobId = new JobID();
+    OperatorID oldOperatorId;
+    createAlternateTableMock();
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(oldJobId)) {
+      harness.setup();
+      harness.open();
+      oldOperatorId = harness.getOperator().getOperatorID();
+
+      assertSnapshotSize(table1, 0);
+      assertSnapshotSize(table2, 0);
+      assertMaxCommittedCheckpointId(table1, oldJobId, oldOperatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, oldJobId, oldOperatorId, -1L);
+
+      for (int i = 1; i <= 3; i++) {
+        rows.add(SimpleDataUtil.createRowData(i, "hello" + i));
+        tableRows.addAll(rows);
+
+        DataFile dataFile1 = writeDataFile(table1, String.format("data-table1-%d", i), rows);
+        DataFile dataFile2 = writeDataFile(table1, String.format("data-table2-%d", i), rows);
+        harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+        harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+        harness.snapshot(++checkpointId, ++timestamp);
+        assertFlinkManifests(0, flinkManifestFolder1);
+        assertFlinkManifests(0, flinkManifestFolder2);
+
+        harness.notifyOfCompletedCheckpoint(checkpointId);
+        assertFlinkManifests(0, flinkManifestFolder1);
+        assertFlinkManifests(0, flinkManifestFolder2);
+
+        SimpleDataUtil.assertTableRows(table1, tableRows, branch);
+        SimpleDataUtil.assertTableRows(table2, tableRows, branch);
+        assertSnapshotSize(table1, i);
+        assertSnapshotSize(table2, i);
+        assertMaxCommittedCheckpointId(table1, oldJobId, oldOperatorId, checkpointId);
+        assertMaxCommittedCheckpointId(table2, oldJobId, oldOperatorId, checkpointId);
+      }
+    }
+
+    // The new started job will start with checkpoint = 1 again.
+    checkpointId = 0;
+    timestamp = 0;
+    JobID newJobId = new JobID();
+    OperatorID newOperatorId;
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(newJobId)) {
+      harness.setup();
+      harness.open();
+      newOperatorId = harness.getOperator().getOperatorID();
+
+      assertSnapshotSize(table1, 3);
+      assertSnapshotSize(table2, 3);
+      assertMaxCommittedCheckpointId(table1, oldJobId, oldOperatorId, 3);
+      assertMaxCommittedCheckpointId(table1, newJobId, newOperatorId, -1);
+      assertMaxCommittedCheckpointId(table2, oldJobId, oldOperatorId, 3);
+      assertMaxCommittedCheckpointId(table2, newJobId, newOperatorId, -1);
+
+      rows.add(SimpleDataUtil.createRowData(2, "world"));
+      tableRows.addAll(rows);
+
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-new-1", rows);
+      DataFile dataFile2 = writeDataFile(table2, "data-table1-new-1", rows);
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+      harness.snapshot(++checkpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+      SimpleDataUtil.assertTableRows(table1, tableRows, branch);
+      SimpleDataUtil.assertTableRows(table2, tableRows, branch);
+      assertSnapshotSize(table1, 4);
+      assertSnapshotSize(table2, 4);
+      assertMaxCommittedCheckpointId(table1, newJobId, newOperatorId, checkpointId);
+      assertMaxCommittedCheckpointId(table2, newJobId, newOperatorId, checkpointId);
+    }
+  }
+
+  @Test
+  public void testStartAnotherJobToWriteSameTableOneSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "false")
+      .commit();
+
+    long checkpointId = 0;
+    long timestamp = 0;
+    List<RowData> rows = Lists.newArrayList();
+    List<RowData> tableRows = Lists.newArrayList();
+
+    JobID oldJobId = new JobID();
+    OperatorID oldOperatorId;
+    createAlternateTableMock();
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(oldJobId)) {
+      harness.setup();
+      harness.open();
+      oldOperatorId = harness.getOperator().getOperatorID();
+
+      assertSnapshotSize(table1, 0);
+      assertSnapshotSize(table2, 0);
+      assertMaxCommittedCheckpointId(table1, oldJobId, oldOperatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, oldJobId, oldOperatorId, -1L);
+
+      for (int i = 1; i <= 3; i++) {
+        rows.add(SimpleDataUtil.createRowData(i, "hello" + i));
+        tableRows.addAll(rows);
+
+        DataFile dataFile1 = writeDataFile(table1, String.format("data-table1-%d", i), rows);
+        DataFile dataFile2 = writeDataFile(table1, String.format("data-table2-%d", i), rows);
+        harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+        harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+        harness.snapshot(++checkpointId, ++timestamp);
+        assertFlinkManifests(0, flinkManifestFolder1);
+        assertFlinkManifests(1, flinkManifestFolder2);
+
+        harness.notifyOfCompletedCheckpoint(checkpointId);
+        assertFlinkManifests(0, flinkManifestFolder1);
+        assertFlinkManifests(0, flinkManifestFolder2);
+
+        SimpleDataUtil.assertTableRows(table1, tableRows, branch);
+        SimpleDataUtil.assertTableRows(table2, tableRows, branch);
+        assertSnapshotSize(table1, i);
+        assertSnapshotSize(table2, i);
+        assertMaxCommittedCheckpointId(table1, oldJobId, oldOperatorId, checkpointId);
+        assertMaxCommittedCheckpointId(table2, oldJobId, oldOperatorId, checkpointId);
+      }
+    }
+
+    // The new started job will start with checkpoint = 1 again.
+    checkpointId = 0;
+    timestamp = 0;
+    JobID newJobId = new JobID();
+    OperatorID newOperatorId;
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(newJobId)) {
+      harness.setup();
+      harness.open();
+      newOperatorId = harness.getOperator().getOperatorID();
+
+      assertSnapshotSize(table1, 3);
+      assertSnapshotSize(table2, 3);
+      assertMaxCommittedCheckpointId(table1, oldJobId, oldOperatorId, 3);
+      assertMaxCommittedCheckpointId(table1, newJobId, newOperatorId, -1);
+      assertMaxCommittedCheckpointId(table2, oldJobId, oldOperatorId, 3);
+      assertMaxCommittedCheckpointId(table2, newJobId, newOperatorId, -1);
+
+      rows.add(SimpleDataUtil.createRowData(2, "world"));
+      tableRows.addAll(rows);
+
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-new-1", rows);
+      DataFile dataFile2 = writeDataFile(table2, "data-table1-new-1", rows);
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+      harness.snapshot(++checkpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(1, flinkManifestFolder2);
+
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+      SimpleDataUtil.assertTableRows(table1, tableRows, branch);
+      SimpleDataUtil.assertTableRows(table2, tableRows, branch);
+      assertSnapshotSize(table1, 4);
+      assertSnapshotSize(table2, 4);
+      assertMaxCommittedCheckpointId(table1, newJobId, newOperatorId, checkpointId);
+      assertMaxCommittedCheckpointId(table2, newJobId, newOperatorId, checkpointId);
+    }
+  }
+
+  @Test
   public void testMultipleJobsWriteSameTable() throws Exception {
     long timestamp = 0;
     List<RowData> tableRows = Lists.newArrayList();
@@ -851,6 +2222,126 @@ public class TestIcebergMultiTableFilesCommitter {
         harness.processElement(of(dataFile2, table2.name()), ++timestamp);
         harness.snapshot(checkpointId + 1, ++timestamp);
         assertFlinkManifests(1, flinkManifestFolder1);
+        assertFlinkManifests(1, flinkManifestFolder2);
+
+        harness.notifyOfCompletedCheckpoint(checkpointId + 1);
+        assertFlinkManifests(0, flinkManifestFolder1);
+        assertFlinkManifests(0, flinkManifestFolder2);
+        SimpleDataUtil.assertTableRows(table1, tableRows, branch);
+        SimpleDataUtil.assertTableRows(table2, tableRows, branch);
+        assertSnapshotSize(table1, i + 1);
+        assertSnapshotSize(table2, i + 1);
+        assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId + 1);
+        assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId + 1);
+      }
+    }
+  }
+
+  @Test
+  public void testMultipleJobsWriteSameTableBothSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+
+    long timestamp = 0;
+    List<RowData> tableRows = Lists.newArrayList();
+
+    JobID[] jobs = new JobID[] {new JobID(), new JobID(), new JobID()};
+    OperatorID[] operatorIds =
+            new OperatorID[] {new OperatorID(), new OperatorID(), new OperatorID()};
+    createAlternateTableMock();
+    for (int i = 0; i < 20; i++) {
+      int jobIndex = i % 3;
+      int checkpointId = i / 3;
+      JobID jobId = jobs[jobIndex];
+      OperatorID operatorId = operatorIds[jobIndex];
+      try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                   createStreamSink(jobId)) {
+        harness.getStreamConfig().setOperatorID(operatorId);
+        harness.setup();
+        harness.open();
+
+        assertSnapshotSize(table1, i);
+        assertSnapshotSize(table2, i);
+        assertMaxCommittedCheckpointId(
+                table1, jobId, operatorId, checkpointId == 0 ? -1 : checkpointId);
+        assertMaxCommittedCheckpointId(
+                table2, jobId, operatorId, checkpointId == 0 ? -1 : checkpointId);
+
+        List<RowData> rows = Lists.newArrayList(SimpleDataUtil.createRowData(i, "word-" + i));
+        tableRows.addAll(rows);
+
+        DataFile dataFile1 = writeDataFile(table1, String.format("data-table1-%d", i), rows);
+        DataFile dataFile2 = writeDataFile(table2, String.format("data-table1-%d", i), rows);
+        harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+        harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+        harness.snapshot(checkpointId + 1, ++timestamp);
+        assertFlinkManifests(0, flinkManifestFolder1);
+        assertFlinkManifests(0, flinkManifestFolder2);
+
+        harness.notifyOfCompletedCheckpoint(checkpointId + 1);
+        assertFlinkManifests(0, flinkManifestFolder1);
+        assertFlinkManifests(0, flinkManifestFolder2);
+        SimpleDataUtil.assertTableRows(table1, tableRows, branch);
+        SimpleDataUtil.assertTableRows(table2, tableRows, branch);
+        assertSnapshotSize(table1, i + 1);
+        assertSnapshotSize(table2, i + 1);
+        assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId + 1);
+        assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId + 1);
+      }
+    }
+  }
+
+  @Test
+  public void testMultipleJobsWriteSameTableOneSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "false")
+      .commit();
+
+    long timestamp = 0;
+    List<RowData> tableRows = Lists.newArrayList();
+
+    JobID[] jobs = new JobID[] {new JobID(), new JobID(), new JobID()};
+    OperatorID[] operatorIds =
+            new OperatorID[] {new OperatorID(), new OperatorID(), new OperatorID()};
+    createAlternateTableMock();
+    for (int i = 0; i < 20; i++) {
+      int jobIndex = i % 3;
+      int checkpointId = i / 3;
+      JobID jobId = jobs[jobIndex];
+      OperatorID operatorId = operatorIds[jobIndex];
+      try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                   createStreamSink(jobId)) {
+        harness.getStreamConfig().setOperatorID(operatorId);
+        harness.setup();
+        harness.open();
+
+        assertSnapshotSize(table1, i);
+        assertSnapshotSize(table2, i);
+        assertMaxCommittedCheckpointId(
+                table1, jobId, operatorId, checkpointId == 0 ? -1 : checkpointId);
+        assertMaxCommittedCheckpointId(
+                table2, jobId, operatorId, checkpointId == 0 ? -1 : checkpointId);
+
+        List<RowData> rows = Lists.newArrayList(SimpleDataUtil.createRowData(i, "word-" + i));
+        tableRows.addAll(rows);
+
+        DataFile dataFile1 = writeDataFile(table1, String.format("data-table1-%d", i), rows);
+        DataFile dataFile2 = writeDataFile(table2, String.format("data-table1-%d", i), rows);
+        harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+        harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+        harness.snapshot(checkpointId + 1, ++timestamp);
+        assertFlinkManifests(0, flinkManifestFolder1);
         assertFlinkManifests(1, flinkManifestFolder2);
 
         harness.notifyOfCompletedCheckpoint(checkpointId + 1);
@@ -998,6 +2489,285 @@ public class TestIcebergMultiTableFilesCommitter {
   }
 
   @Test
+  public void testMultipleSinksRecoveryFromValidSnapshotBothSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+
+    long checkpointId = 0;
+    long timestamp = 0;
+    List<RowData> expectedRows = Lists.newArrayList();
+    OperatorSubtaskState snapshot1;
+    OperatorSubtaskState snapshot2;
+
+    JobID jobId = new JobID();
+    OperatorID operatorId1 = new OperatorID();
+    OperatorID operatorId2 = new OperatorID();
+    createAlternateTableMock();
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness1 =
+                 createStreamSink(jobId);
+         OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness2 =
+                 createStreamSink(jobId)) {
+      harness1.getStreamConfig().setOperatorID(operatorId1);
+      harness1.setup();
+      harness1.open();
+      harness2.getStreamConfig().setOperatorID(operatorId2);
+      harness2.setup();
+      harness2.open();
+
+      assertSnapshotSize(table1, 0);
+      assertSnapshotSize(table2, 0);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId1, -1L);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId2, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId1, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId2, -1L);
+
+      RowData row1 = SimpleDataUtil.createRowData(1, "hello1");
+      expectedRows.add(row1);
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-1-1", ImmutableList.of(row1));
+      DataFile dataFile2 = writeDataFile(table2, "data-table2-1-1", ImmutableList.of(row1));
+
+      harness1.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness1.processElement(of(dataFile2, table2.name()), ++timestamp);
+      snapshot1 = harness1.snapshot(++checkpointId, ++timestamp);
+
+      RowData row2 = SimpleDataUtil.createRowData(1, "hello2");
+      expectedRows.add(row2);
+      DataFile dataFile3 = writeDataFile(table1, "data-table1-1-2", ImmutableList.of(row2));
+      DataFile dataFile4 = writeDataFile(table2, "data-table2-1-2", ImmutableList.of(row2));
+
+      harness2.processElement(of(dataFile3, table1.name()), ++timestamp);
+      harness2.processElement(of(dataFile4, table2.name()), ++timestamp);
+      snapshot2 = harness2.snapshot(checkpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      // Only notify one of the committers
+      harness1.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, expectedRows, branch);
+      assertSnapshotSize(table1, 2);
+      assertSnapshotSize(table2, 2);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId1, checkpointId);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId2, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId1, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId2, checkpointId);
+    }
+
+    // Restore from the given snapshot
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness1 =
+                 createStreamSink(jobId);
+         OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness2 =
+                 createStreamSink(jobId)) {
+      harness1.getStreamConfig().setOperatorID(operatorId1);
+      harness1.setup();
+      harness1.initializeState(snapshot1);
+      harness1.open();
+
+      harness2.getStreamConfig().setOperatorID(operatorId2);
+      harness2.setup();
+      harness2.initializeState(snapshot2);
+      harness2.open();
+
+      // All flink manifests should be cleaned because it has committed the unfinished iceberg
+      // transaction.
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, expectedRows, branch);
+      assertSnapshotSize(table1, 2);
+      assertSnapshotSize(table2, 2);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId1, checkpointId);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId2, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId1, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId2, checkpointId);
+
+      RowData row1 = SimpleDataUtil.createRowData(2, "world1");
+      expectedRows.add(row1);
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-2-1", ImmutableList.of(row1));
+      DataFile dataFile2 = writeDataFile(table2, "data-table1-2-1", ImmutableList.of(row1));
+
+      harness1.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness1.processElement(of(dataFile2, table2.name()), ++timestamp);
+      harness1.snapshot(++checkpointId, ++timestamp);
+
+      RowData row2 = SimpleDataUtil.createRowData(2, "world2");
+      expectedRows.add(row2);
+      DataFile dataFile3 = writeDataFile(table1, "data-table1-2-2", ImmutableList.of(row2));
+      DataFile dataFile4 = writeDataFile(table2, "data-table2-2-2", ImmutableList.of(row2));
+      harness2.processElement(of(dataFile3, table1.name()), ++timestamp);
+      harness2.processElement(of(dataFile4, table2.name()), ++timestamp);
+      harness2.snapshot(checkpointId, ++timestamp);
+
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      harness1.notifyOfCompletedCheckpoint(checkpointId);
+      harness2.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, expectedRows, branch);
+      assertSnapshotSize(table1, 4);
+      assertSnapshotSize(table2, 4);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId1, checkpointId);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId2, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId1, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId2, checkpointId);
+    }
+  }
+
+  @Test
+  public void testMultipleSinksRecoveryFromValidSnapshotOneSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "false")
+      .commit();
+
+    long checkpointId = 0;
+    long timestamp = 0;
+    List<RowData> expectedRows = Lists.newArrayList();
+    OperatorSubtaskState snapshot1;
+    OperatorSubtaskState snapshot2;
+
+    JobID jobId = new JobID();
+    OperatorID operatorId1 = new OperatorID();
+    OperatorID operatorId2 = new OperatorID();
+    createAlternateTableMock();
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness1 =
+                 createStreamSink(jobId);
+         OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness2 =
+                 createStreamSink(jobId)) {
+      harness1.getStreamConfig().setOperatorID(operatorId1);
+      harness1.setup();
+      harness1.open();
+      harness2.getStreamConfig().setOperatorID(operatorId2);
+      harness2.setup();
+      harness2.open();
+
+      assertSnapshotSize(table1, 0);
+      assertSnapshotSize(table2, 0);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId1, -1L);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId2, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId1, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId2, -1L);
+
+      RowData row1 = SimpleDataUtil.createRowData(1, "hello1");
+      expectedRows.add(row1);
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-1-1", ImmutableList.of(row1));
+      DataFile dataFile2 = writeDataFile(table2, "data-table2-1-1", ImmutableList.of(row1));
+
+      harness1.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness1.processElement(of(dataFile2, table2.name()), ++timestamp);
+      snapshot1 = harness1.snapshot(++checkpointId, ++timestamp);
+
+      RowData row2 = SimpleDataUtil.createRowData(1, "hello2");
+      expectedRows.add(row2);
+      DataFile dataFile3 = writeDataFile(table1, "data-table1-1-2", ImmutableList.of(row2));
+      DataFile dataFile4 = writeDataFile(table2, "data-table2-1-2", ImmutableList.of(row2));
+
+      harness2.processElement(of(dataFile3, table1.name()), ++timestamp);
+      harness2.processElement(of(dataFile4, table2.name()), ++timestamp);
+      snapshot2 = harness2.snapshot(checkpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(2, flinkManifestFolder2);
+
+      // Only notify one of the committers
+      harness1.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(1, flinkManifestFolder2);
+
+      // Only the first row is committed at this point
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(row1), branch);
+      assertSnapshotSize(table1, 2);
+      assertSnapshotSize(table2, 1);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId1, checkpointId);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId2, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId1, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId2, -1);
+    }
+
+    // Restore from the given snapshot
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness1 =
+                 createStreamSink(jobId);
+         OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness2 =
+                 createStreamSink(jobId)) {
+      harness1.getStreamConfig().setOperatorID(operatorId1);
+      harness1.setup();
+      harness1.initializeState(snapshot1);
+      harness1.open();
+
+      harness2.getStreamConfig().setOperatorID(operatorId2);
+      harness2.setup();
+      harness2.initializeState(snapshot2);
+      harness2.open();
+
+      // All flink manifests should be cleaned because it has committed the unfinished iceberg
+      // transaction.
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, expectedRows, branch);
+      assertSnapshotSize(table1, 2);
+      assertSnapshotSize(table2, 2);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId1, checkpointId);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId2, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId1, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId2, checkpointId);
+
+      RowData row1 = SimpleDataUtil.createRowData(2, "world1");
+      expectedRows.add(row1);
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-2-1", ImmutableList.of(row1));
+      DataFile dataFile2 = writeDataFile(table2, "data-table1-2-1", ImmutableList.of(row1));
+
+      harness1.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness1.processElement(of(dataFile2, table2.name()), ++timestamp);
+      harness1.snapshot(++checkpointId, ++timestamp);
+
+      RowData row2 = SimpleDataUtil.createRowData(2, "world2");
+      expectedRows.add(row2);
+      DataFile dataFile3 = writeDataFile(table1, "data-table1-2-2", ImmutableList.of(row2));
+      DataFile dataFile4 = writeDataFile(table2, "data-table2-2-2", ImmutableList.of(row2));
+      harness2.processElement(of(dataFile3, table1.name()), ++timestamp);
+      harness2.processElement(of(dataFile4, table2.name()), ++timestamp);
+      harness2.snapshot(checkpointId, ++timestamp);
+
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(2, flinkManifestFolder2);
+
+      harness1.notifyOfCompletedCheckpoint(checkpointId);
+      harness2.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, expectedRows, branch);
+      SimpleDataUtil.assertTableRows(table2, expectedRows, branch);
+      assertSnapshotSize(table1, 4);
+      assertSnapshotSize(table2, 4);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId1, checkpointId);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId2, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId1, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId2, checkpointId);
+    }
+  }
+
+  @Test
   public void testBoundedStream() throws Exception {
     JobID jobId = new JobID();
     OperatorID operatorId;
@@ -1037,6 +2807,110 @@ public class TestIcebergMultiTableFilesCommitter {
       Assert.assertEquals(
           TestIcebergMultiTableFilesCommitter.class.getName(),
           SimpleDataUtil.latestSnapshot(table2, branch).summary().get("flink.test"));
+    }
+  }
+
+  @Test
+  public void testBoundedStreamBothSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    createAlternateTableMock();
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+      assertSnapshotSize(table1, 0);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertSnapshotSize(table2, 0);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      List<RowData> tableRows = Lists.newArrayList(SimpleDataUtil.createRowData(1, "word-1"));
+
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-1", tableRows);
+      DataFile dataFile2 = writeDataFile(table2, "data-table2-1", tableRows);
+      harness.processElement(of(dataFile1, table1.name()), 1);
+      harness.processElement(of(dataFile2, table2.name()), 1);
+      ((BoundedOneInput) harness.getOneInputOperator()).endInput();
+
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+      SimpleDataUtil.assertTableRows(table1, tableRows, branch);
+      SimpleDataUtil.assertTableRows(table2, tableRows, branch);
+      assertSnapshotSize(table1, 1);
+      assertSnapshotSize(table2, 1);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, Long.MAX_VALUE);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, Long.MAX_VALUE);
+      Assert.assertEquals(
+              TestIcebergMultiTableFilesCommitter.class.getName(),
+              SimpleDataUtil.latestSnapshot(table1, branch).summary().get("flink.test"));
+      Assert.assertEquals(
+              TestIcebergMultiTableFilesCommitter.class.getName(),
+              SimpleDataUtil.latestSnapshot(table2, branch).summary().get("flink.test"));
+    }
+  }
+
+  @Test
+  public void testBoundedStreamOneSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "false")
+      .commit();
+
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    createAlternateTableMock();
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+      assertSnapshotSize(table1, 0);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertSnapshotSize(table2, 0);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      List<RowData> tableRows = Lists.newArrayList(SimpleDataUtil.createRowData(1, "word-1"));
+
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-1", tableRows);
+      DataFile dataFile2 = writeDataFile(table2, "data-table2-1", tableRows);
+      harness.processElement(of(dataFile1, table1.name()), 1);
+      harness.processElement(of(dataFile2, table2.name()), 1);
+      ((BoundedOneInput) harness.getOneInputOperator()).endInput();
+
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+      SimpleDataUtil.assertTableRows(table1, tableRows, branch);
+      SimpleDataUtil.assertTableRows(table2, tableRows, branch);
+      assertSnapshotSize(table1, 1);
+      assertSnapshotSize(table2, 1);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, Long.MAX_VALUE);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, Long.MAX_VALUE);
+      Assert.assertEquals(
+              TestIcebergMultiTableFilesCommitter.class.getName(),
+              SimpleDataUtil.latestSnapshot(table1, branch).summary().get("flink.test"));
+      Assert.assertEquals(
+              TestIcebergMultiTableFilesCommitter.class.getName(),
+              SimpleDataUtil.latestSnapshot(table2, branch).summary().get("flink.test"));
     }
   }
 
@@ -1090,6 +2964,119 @@ public class TestIcebergMultiTableFilesCommitter {
       Assert.assertEquals(1, dataFiles1.size());
       Assert.assertEquals(1, dataFiles2.size());
       TestHelpers.assertEquals(dataFile1, dataFiles1.get(0));
+      TestHelpers.assertEquals(dataFile2, dataFiles2.get(0));
+
+      // 3. notifyCheckpointComplete for checkpoint#1
+      harness.notifyOfCompletedCheckpoint(checkpoint);
+      SimpleDataUtil.assertTableRows(table1, ImmutableList.of(row1), branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpoint);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(row1), branch);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpoint);
+      assertFlinkManifests(0, flinkManifestFolder2);
+    }
+  }
+
+  @Test
+  public void testFlinkManifestsBothSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+
+    long timestamp = 0;
+    final long checkpoint = 10;
+
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    createAlternateTableMock();
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      RowData row1 = SimpleDataUtil.createRowData(1, "hello");
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-1", ImmutableList.of(row1));
+      DataFile dataFile2 = writeDataFile(table2, "data-table2-1", ImmutableList.of(row1));
+
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      // 1. snapshotState for checkpoint#1
+      harness.snapshot(checkpoint, ++timestamp);
+      List<Path> manifestPaths1 = assertFlinkManifests(0, flinkManifestFolder1);
+      List<Path> manifestPaths2 = assertFlinkManifests(0, flinkManifestFolder2);
+
+      // 2. notifyCheckpointComplete for checkpoint#1
+      harness.notifyOfCompletedCheckpoint(checkpoint);
+      SimpleDataUtil.assertTableRows(table1, ImmutableList.of(row1), branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpoint);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(row1), branch);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpoint);
+      assertFlinkManifests(0, flinkManifestFolder2);
+    }
+  }
+
+  @Test
+  public void testFlinkManifestsOneSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "false")
+      .commit();
+
+    long timestamp = 0;
+    final long checkpoint = 10;
+
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    createAlternateTableMock();
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+        createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      RowData row1 = SimpleDataUtil.createRowData(1, "hello");
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-1", ImmutableList.of(row1));
+      DataFile dataFile2 = writeDataFile(table2, "data-table2-1", ImmutableList.of(row1));
+
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      // 1. snapshotState for checkpoint#1
+      harness.snapshot(checkpoint, ++timestamp);
+      List<Path> manifestPaths1 = assertFlinkManifests(0, flinkManifestFolder1);
+      List<Path> manifestPaths2 = assertFlinkManifests(1, flinkManifestFolder2);
+      Assert.assertEquals(
+          "File name should have the expected pattern.",
+          String.format("%s-%s-%05d-%d-%d-%05d.avro", jobId, operatorId, 0, 0, checkpoint, 1),
+          manifestPaths2.get(0).getFileName().toString());
+
+      // 2. Read the data files from manifests and assert.
+      List<DataFile> dataFiles2 =
+          FlinkManifestUtil.readDataFiles(
+              createTestingManifestFile(manifestPaths2.get(0)), table2.io(), table2.specs());
+      Assert.assertEquals(1, dataFiles2.size());
       TestHelpers.assertEquals(dataFile2, dataFiles2.get(0));
 
       // 3. notifyCheckpointComplete for checkpoint#1
@@ -1203,6 +3190,189 @@ public class TestIcebergMultiTableFilesCommitter {
   }
 
   @Test
+  public void testDeleteFilesBothSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+
+    Assume.assumeFalse("Only support equality-delete in format v2.", formatVersion < 2);
+
+    long timestamp = 0;
+    long checkpoint = 10;
+
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    FileAppenderFactory<RowData> appenderFactory1 = createDeletableAppenderFactory(table1);
+    FileAppenderFactory<RowData> appenderFactory2 = createDeletableAppenderFactory(table2);
+    createAlternateTableMock();
+
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      RowData row1 = SimpleDataUtil.createInsert(1, "aaa");
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-file-1", ImmutableList.of(row1));
+      DataFile dataFile2 = writeDataFile(table2, "data-table2-file-1", ImmutableList.of(row1));
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      // 1. snapshotState for checkpoint#1
+      harness.snapshot(checkpoint, ++timestamp);
+      List<Path> manifestPaths1 = assertFlinkManifests(0, flinkManifestFolder1);
+      List<Path> manifestPaths2 = assertFlinkManifests(0, flinkManifestFolder2);
+
+      // 2. notifyCheckpointComplete for checkpoint#1
+      harness.notifyOfCompletedCheckpoint(checkpoint);
+      SimpleDataUtil.assertTableRows(table1, ImmutableList.of(row1), branch);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(row1), branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpoint);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpoint);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      // 3. process both data files and delete files.
+      RowData row2 = SimpleDataUtil.createInsert(2, "bbb");
+      DataFile dataFile3 = writeDataFile(table1, "data-table1-file-2", ImmutableList.of(row2));
+      DataFile dataFile4 = writeDataFile(table2, "data-table1-file-2", ImmutableList.of(row2));
+
+      RowData delete1 = SimpleDataUtil.createDelete(1, "aaa");
+      DeleteFile deleteFile1 =
+              writeEqDeleteFile(
+                      appenderFactory1, "delete-table1-file-1", ImmutableList.of(delete1), table1);
+      DeleteFile deleteFile2 =
+              writeEqDeleteFile(
+                      appenderFactory2, "delete-table2-file-1", ImmutableList.of(delete1), table2);
+      harness.processElement(of(dataFile3, deleteFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile4, deleteFile2, table2.name()), ++timestamp);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpoint);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpoint);
+
+      // 4. snapshotState for checkpoint#2
+      harness.snapshot(++checkpoint, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      // 5. notifyCheckpointComplete for checkpoint#2
+      harness.notifyOfCompletedCheckpoint(checkpoint);
+      SimpleDataUtil.assertTableRows(table1, ImmutableList.of(row2), branch);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(row2), branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpoint);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpoint);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+    }
+  }
+
+  @Test
+  public void testDeleteFilesOneSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "false")
+      .commit();
+
+    Assume.assumeFalse("Only support equality-delete in format v2.", formatVersion < 2);
+
+    long timestamp = 0;
+    long checkpoint = 10;
+
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    FileAppenderFactory<RowData> appenderFactory1 = createDeletableAppenderFactory(table1);
+    FileAppenderFactory<RowData> appenderFactory2 = createDeletableAppenderFactory(table2);
+    createAlternateTableMock();
+
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+        createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      RowData row1 = SimpleDataUtil.createInsert(1, "aaa");
+      DataFile dataFile1 = writeDataFile(table1, "data-table1-file-1", ImmutableList.of(row1));
+      DataFile dataFile2 = writeDataFile(table2, "data-table2-file-1", ImmutableList.of(row1));
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      // 1. snapshotState for checkpoint#1
+      harness.snapshot(checkpoint, ++timestamp);
+      List<Path> manifestPaths1 = assertFlinkManifests(0, flinkManifestFolder1);
+      List<Path> manifestPaths2 = assertFlinkManifests(1, flinkManifestFolder2);
+      Assert.assertEquals(
+          "File name should have the expected pattern.",
+          String.format("%s-%s-%05d-%d-%d-%05d.avro", jobId, operatorId, 0, 0, checkpoint, 1),
+          manifestPaths2.get(0).getFileName().toString());
+
+      // 2. Read the data files from manifests and assert.
+      List<DataFile> dataFiles2 =
+          FlinkManifestUtil.readDataFiles(
+              createTestingManifestFile(manifestPaths2.get(0)), table2.io(), table2.specs());
+      Assert.assertEquals(1, dataFiles2.size());
+      TestHelpers.assertEquals(dataFile2, dataFiles2.get(0));
+
+      // 3. notifyCheckpointComplete for checkpoint#1
+      harness.notifyOfCompletedCheckpoint(checkpoint);
+      SimpleDataUtil.assertTableRows(table1, ImmutableList.of(row1), branch);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(row1), branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpoint);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpoint);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      // 4. process both data files and delete files.
+      RowData row2 = SimpleDataUtil.createInsert(2, "bbb");
+      DataFile dataFile3 = writeDataFile(table1, "data-table1-file-2", ImmutableList.of(row2));
+      DataFile dataFile4 = writeDataFile(table2, "data-table1-file-2", ImmutableList.of(row2));
+
+      RowData delete1 = SimpleDataUtil.createDelete(1, "aaa");
+      DeleteFile deleteFile1 =
+          writeEqDeleteFile(
+              appenderFactory1, "delete-table1-file-1", ImmutableList.of(delete1), table1);
+      DeleteFile deleteFile2 =
+          writeEqDeleteFile(
+              appenderFactory2, "delete-table2-file-1", ImmutableList.of(delete1), table2);
+      harness.processElement(of(dataFile3, deleteFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile4, deleteFile2, table2.name()), ++timestamp);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpoint);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpoint);
+
+      // 5. snapshotState for checkpoint#2
+      harness.snapshot(++checkpoint, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(2, flinkManifestFolder2);
+
+      // 6. notifyCheckpointComplete for checkpoint#2
+      harness.notifyOfCompletedCheckpoint(checkpoint);
+      SimpleDataUtil.assertTableRows(table1, ImmutableList.of(row2), branch);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(row2), branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpoint);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpoint);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+    }
+  }
+
+  @Test
   public void testCommitTwoCheckpointsInSingleTxn() throws Exception {
     Assume.assumeFalse("Only support equality-delete in format v2.", formatVersion < 2);
 
@@ -1266,6 +3436,158 @@ public class TestIcebergMultiTableFilesCommitter {
           "Should have committed 2 txn.", 2, ImmutableList.copyOf(table1.snapshots()).size());
       Assert.assertEquals(
           "Should have committed 2 txn.", 2, ImmutableList.copyOf(table2.snapshots()).size());
+    }
+  }
+
+  @Test
+  public void testCommitTwoCheckpointsInSingleTxnBothSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+
+    Assume.assumeFalse("Only support equality-delete in format v2.", formatVersion < 2);
+
+    long timestamp = 0;
+    long checkpoint = 10;
+
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    FileAppenderFactory<RowData> appenderFactory1 = createDeletableAppenderFactory(table1);
+    FileAppenderFactory<RowData> appenderFactory2 = createDeletableAppenderFactory(table2);
+    createAlternateTableMock();
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      RowData insert1 = SimpleDataUtil.createInsert(1, "aaa");
+      RowData insert2 = SimpleDataUtil.createInsert(2, "bbb");
+      RowData delete3 = SimpleDataUtil.createDelete(3, "ccc");
+      DataFile dataFile1 =
+              writeDataFile(table1, "data-table1-file-1", ImmutableList.of(insert1, insert2));
+      DataFile dataFile2 =
+              writeDataFile(table2, "data-table2-file-1", ImmutableList.of(insert1, insert2));
+      DeleteFile deleteFile1 =
+              writeEqDeleteFile(appenderFactory1, "delete-file-1", ImmutableList.of(delete3), table1);
+      DeleteFile deleteFile2 =
+              writeEqDeleteFile(appenderFactory2, "delete-file-1", ImmutableList.of(delete3), table2);
+      harness.processElement(of(dataFile1, deleteFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, deleteFile2, table2.name()), ++timestamp);
+
+      // The 1th snapshotState.
+      harness.snapshot(checkpoint, ++timestamp);
+
+      RowData insert4 = SimpleDataUtil.createInsert(4, "ddd");
+      RowData delete2 = SimpleDataUtil.createDelete(2, "bbb");
+      DataFile dataFile3 = writeDataFile(table1, "data-table1-file-2", ImmutableList.of(insert4));
+      DataFile dataFile4 = writeDataFile(table2, "data-table2-file-2", ImmutableList.of(insert4));
+      DeleteFile deleteFile3 =
+              writeEqDeleteFile(appenderFactory1, "delete-file-2", ImmutableList.of(delete2), table1);
+      DeleteFile deleteFile4 =
+              writeEqDeleteFile(appenderFactory2, "delete-file-2", ImmutableList.of(delete2), table2);
+      harness.processElement(of(dataFile3, deleteFile3, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile4, deleteFile4, table2.name()), ++timestamp);
+
+      // The 2nd snapshotState.
+      harness.snapshot(++checkpoint, ++timestamp);
+
+      // Notify the 2nd snapshot to complete.
+      harness.notifyOfCompletedCheckpoint(checkpoint);
+      SimpleDataUtil.assertTableRows(table1, ImmutableList.of(insert1, insert4), branch);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(insert1, insert4), branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpoint);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpoint);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+      Assert.assertEquals(
+              "Should have committed 2 txn.", 2, ImmutableList.copyOf(table1.snapshots()).size());
+      Assert.assertEquals(
+              "Should have committed 2 txn.", 2, ImmutableList.copyOf(table2.snapshots()).size());
+    }
+  }
+
+  @Test
+  public void testCommitTwoCheckpointsInSingleTxnOneSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "false")
+      .commit();
+
+    Assume.assumeFalse("Only support equality-delete in format v2.", formatVersion < 2);
+
+    long timestamp = 0;
+    long checkpoint = 10;
+
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    FileAppenderFactory<RowData> appenderFactory1 = createDeletableAppenderFactory(table1);
+    FileAppenderFactory<RowData> appenderFactory2 = createDeletableAppenderFactory(table2);
+    createAlternateTableMock();
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, -1L);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, -1L);
+
+      RowData insert1 = SimpleDataUtil.createInsert(1, "aaa");
+      RowData insert2 = SimpleDataUtil.createInsert(2, "bbb");
+      RowData delete3 = SimpleDataUtil.createDelete(3, "ccc");
+      DataFile dataFile1 =
+              writeDataFile(table1, "data-table1-file-1", ImmutableList.of(insert1, insert2));
+      DataFile dataFile2 =
+              writeDataFile(table2, "data-table2-file-1", ImmutableList.of(insert1, insert2));
+      DeleteFile deleteFile1 =
+              writeEqDeleteFile(appenderFactory1, "delete-file-1", ImmutableList.of(delete3), table1);
+      DeleteFile deleteFile2 =
+              writeEqDeleteFile(appenderFactory2, "delete-file-1", ImmutableList.of(delete3), table2);
+      harness.processElement(of(dataFile1, deleteFile1, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile2, deleteFile2, table2.name()), ++timestamp);
+
+      // The 1th snapshotState.
+      harness.snapshot(checkpoint, ++timestamp);
+
+      RowData insert4 = SimpleDataUtil.createInsert(4, "ddd");
+      RowData delete2 = SimpleDataUtil.createDelete(2, "bbb");
+      DataFile dataFile3 = writeDataFile(table1, "data-table1-file-2", ImmutableList.of(insert4));
+      DataFile dataFile4 = writeDataFile(table2, "data-table2-file-2", ImmutableList.of(insert4));
+      DeleteFile deleteFile3 =
+              writeEqDeleteFile(appenderFactory1, "delete-file-2", ImmutableList.of(delete2), table1);
+      DeleteFile deleteFile4 =
+              writeEqDeleteFile(appenderFactory2, "delete-file-2", ImmutableList.of(delete2), table2);
+      harness.processElement(of(dataFile3, deleteFile3, table1.name()), ++timestamp);
+      harness.processElement(of(dataFile4, deleteFile4, table2.name()), ++timestamp);
+
+      // The 2nd snapshotState.
+      harness.snapshot(++checkpoint, ++timestamp);
+
+      // Notify the 2nd snapshot to complete.
+      harness.notifyOfCompletedCheckpoint(checkpoint);
+      SimpleDataUtil.assertTableRows(table1, ImmutableList.of(insert1, insert4), branch);
+      SimpleDataUtil.assertTableRows(table2, ImmutableList.of(insert1, insert4), branch);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpoint);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpoint);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+      Assert.assertEquals(
+              "Should have committed 2 txn.", 2, ImmutableList.copyOf(table1.snapshots()).size());
+      Assert.assertEquals(
+              "Should have committed 2 txn.", 2, ImmutableList.copyOf(table2.snapshots()).size());
     }
   }
 
@@ -1410,6 +3732,273 @@ public class TestIcebergMultiTableFilesCommitter {
     }
   }
 
+  @Test
+  public void testSpecEvolutionBothSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+
+    long timestamp = 0;
+    int checkpointId = 0;
+    List<RowData> rows = Lists.newArrayList();
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    OperatorSubtaskState snapshot;
+    DataFile dataFile1;
+    DataFile dataFile2;
+    int specId1;
+    int specId2;
+    createAlternateTableMock();
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+      assertSnapshotSize(table1, 0);
+      assertSnapshotSize(table2, 0);
+      checkpointId++;
+      RowData rowData = SimpleDataUtil.createRowData(checkpointId, "hello" + checkpointId);
+      dataFile1 = writeDataFile(table1, "data-table1-" + checkpointId, ImmutableList.of(rowData));
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      dataFile2 = writeDataFile(table2, "data-table2-" + checkpointId, ImmutableList.of(rowData));
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+      rows.add(rowData);
+      harness.snapshot(checkpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+      table1.refresh();
+      PartitionSpec oldSpec1 = table1.spec();
+      table1.updateSpec().addField("id").commit();
+      table2.refresh();
+      PartitionSpec oldSpec2 = table2.spec();
+      table2.updateSpec().addField("id").commit();
+      checkpointId++;
+
+      rowData = SimpleDataUtil.createRowData(checkpointId, "hello" + checkpointId);
+      dataFile1 =
+              writeDataFile(
+                      "data-table1-" + checkpointId, ImmutableList.of(rowData), oldSpec1, null, table1);
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      dataFile2 =
+              writeDataFile(
+                      "data-table2-" + checkpointId, ImmutableList.of(rowData), oldSpec2, null, table2);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+      rows.add(rowData);
+      snapshot = harness.snapshot(checkpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, rows, branch);
+      assertSnapshotSize(table1, checkpointId);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId);
+      SimpleDataUtil.assertTableRows(table2, rows, branch);
+      assertSnapshotSize(table2, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId);
+    }
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.getStreamConfig().setOperatorID(operatorId);
+      harness.setup();
+      harness.initializeState(snapshot);
+      harness.open();
+      assertSnapshotSize(table1, checkpointId);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId);
+      assertSnapshotSize(table2, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId);
+      checkpointId++;
+      RowData row = SimpleDataUtil.createRowData(checkpointId, "world" + checkpointId);
+      StructLike partition1 = new PartitionData(table1.spec().partitionType());
+      partition1.set(0, checkpointId);
+      dataFile1 =
+              writeDataFile(
+                      "data-table1-" + checkpointId,
+                      ImmutableList.of(row),
+                      table1.spec(),
+                      partition1,
+                      table1);
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      rows.add(row);
+      StructLike partition2 = new PartitionData(table2.spec().partitionType());
+      partition2.set(0, checkpointId);
+      dataFile2 =
+              writeDataFile(
+                      "data-table2-" + checkpointId,
+                      ImmutableList.of(row),
+                      table2.spec(),
+                      partition2,
+                      table2);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+      harness.snapshot(checkpointId, ++timestamp);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, rows, branch);
+      assertSnapshotSize(table1, checkpointId);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId);
+      SimpleDataUtil.assertTableRows(table2, rows, branch);
+      assertSnapshotSize(table2, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId);
+    }
+  }
+
+  @Test
+  public void testSpecEvolutionOneSPC() throws Exception {
+    table1
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "true")
+      .commit();
+    table2
+      .updateProperties()
+      .set(SINGLE_PHASE_COMMIT_ENABLED, "false")
+      .commit();
+
+    long timestamp = 0;
+    int checkpointId = 0;
+    List<RowData> rows = Lists.newArrayList();
+    JobID jobId = new JobID();
+    OperatorID operatorId;
+    OperatorSubtaskState snapshot;
+    DataFile dataFile1;
+    DataFile dataFile2;
+    int specId1;
+    int specId2;
+    createAlternateTableMock();
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.setup();
+      harness.open();
+      operatorId = harness.getOperator().getOperatorID();
+      assertSnapshotSize(table1, 0);
+      assertSnapshotSize(table2, 0);
+      checkpointId++;
+      RowData rowData = SimpleDataUtil.createRowData(checkpointId, "hello" + checkpointId);
+      dataFile1 = writeDataFile(table1, "data-table1-" + checkpointId, ImmutableList.of(rowData));
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      dataFile2 = writeDataFile(table2, "data-table2-" + checkpointId, ImmutableList.of(rowData));
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+      rows.add(rowData);
+      harness.snapshot(checkpointId, ++timestamp);
+
+      specId2 =
+              getStagingManifestSpecId(
+                      harness.getOperator().getOperatorStateBackend(),
+                      checkpointId,
+                      TableIdentifier.of("dummy", table2.name()));
+      assertThat(specId2).isEqualTo(table2.spec().specId());
+
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+      table1.refresh();
+      PartitionSpec oldSpec1 = table1.spec();
+      table1.updateSpec().addField("id").commit();
+      table2.refresh();
+      PartitionSpec oldSpec2 = table2.spec();
+      table2.updateSpec().addField("id").commit();
+      checkpointId++;
+
+      rowData = SimpleDataUtil.createRowData(checkpointId, "hello" + checkpointId);
+      dataFile1 =
+              writeDataFile(
+                      "data-table1-" + checkpointId, ImmutableList.of(rowData), oldSpec1, null, table1);
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      dataFile2 =
+              writeDataFile(
+                      "data-table2-" + checkpointId, ImmutableList.of(rowData), oldSpec2, null, table2);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+      rows.add(rowData);
+      snapshot = harness.snapshot(checkpointId, ++timestamp);
+      specId2 =
+          getStagingManifestSpecId(
+              harness.getOperator().getOperatorStateBackend(),
+              checkpointId,
+              TableIdentifier.of("dummy", table2.name()));
+      assertThat(specId2).isEqualTo(oldSpec2.specId());
+
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, rows, branch);
+      assertSnapshotSize(table1, checkpointId);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId);
+      SimpleDataUtil.assertTableRows(table2, rows, branch);
+      assertSnapshotSize(table2, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId);
+    }
+    try (OneInputStreamOperatorTestHarness<TableAwareWriteResult, Void> harness =
+                 createStreamSink(jobId)) {
+      harness.getStreamConfig().setOperatorID(operatorId);
+      harness.setup();
+      harness.initializeState(snapshot);
+      harness.open();
+      assertSnapshotSize(table1, checkpointId);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId);
+      assertSnapshotSize(table2, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId);
+      checkpointId++;
+      RowData row = SimpleDataUtil.createRowData(checkpointId, "world" + checkpointId);
+      StructLike partition1 = new PartitionData(table1.spec().partitionType());
+      partition1.set(0, checkpointId);
+      dataFile1 =
+              writeDataFile(
+                      "data-table1-" + checkpointId,
+                      ImmutableList.of(row),
+                      table1.spec(),
+                      partition1,
+                      table1);
+      harness.processElement(of(dataFile1, table1.name()), ++timestamp);
+      rows.add(row);
+      StructLike partition2 = new PartitionData(table2.spec().partitionType());
+      partition2.set(0, checkpointId);
+      dataFile2 =
+              writeDataFile(
+                      "data-table2-" + checkpointId,
+                      ImmutableList.of(row),
+                      table2.spec(),
+                      partition2,
+                      table2);
+      harness.processElement(of(dataFile2, table2.name()), ++timestamp);
+      harness.snapshot(checkpointId, ++timestamp);
+      specId2 =
+          getStagingManifestSpecId(
+              harness.getOperator().getOperatorStateBackend(),
+              checkpointId,
+              TableIdentifier.of("dummy", table2.name()));
+      assertThat(specId2).isEqualTo(table2.spec().specId());
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(1, flinkManifestFolder2);
+
+      harness.notifyOfCompletedCheckpoint(checkpointId);
+      assertFlinkManifests(0, flinkManifestFolder1);
+      assertFlinkManifests(0, flinkManifestFolder2);
+
+      SimpleDataUtil.assertTableRows(table1, rows, branch);
+      assertSnapshotSize(table1, checkpointId);
+      assertMaxCommittedCheckpointId(table1, jobId, operatorId, checkpointId);
+      SimpleDataUtil.assertTableRows(table2, rows, branch);
+      assertSnapshotSize(table2, checkpointId);
+      assertMaxCommittedCheckpointId(table2, jobId, operatorId, checkpointId);
+    }
+  }
+
   private DataFile writeDataFile(
       String filename, List<RowData> rows, PartitionSpec spec, StructLike partition, Table table)
       throws IOException {
@@ -1483,21 +4072,8 @@ public class TestIcebergMultiTableFilesCommitter {
   }
 
   private void createAlternateTableMock() {
-    Mockito.when(tableLoader.loadTable())
-        .thenAnswer(
-            new Answer<Table>() {
-              private int invocationCount = 0;
-
-              @Override
-              public Table answer(InvocationOnMock invocation) throws Throwable {
-                invocationCount++;
-                if (invocationCount % 2 == 1) {
-                  return table1;
-                } else {
-                  return table2;
-                }
-              }
-            });
+    Mockito.when(tableLoader1.loadTable()).thenReturn(table1);
+    Mockito.when(tableLoader2.loadTable()).thenReturn(table2);
   }
 
   private DataFile writeDataFile(Table table, String filename, List<RowData> rows)
