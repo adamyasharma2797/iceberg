@@ -229,7 +229,7 @@ project(":iceberg-flink:iceberg-flink-runtime-${flinkMajorVersion}") {
     }
 
     // Relocate dependencies to avoid conflicts
-    relocate 'org.apache.avro', 'org.apache.iceberg.shaded.org.apache.avro'
+//    relocate 'org.apache.avro', 'org.apache.iceberg.shaded.org.apache.avro'
     relocate 'org.apache.parquet', 'org.apache.iceberg.shaded.org.apache.parquet'
     relocate 'com.google.errorprone', 'org.apache.iceberg.shaded.com.google.errorprone'
     relocate 'com.google.flatbuffers', 'org.apache.iceberg.shaded.com.google.flatbuffers'
