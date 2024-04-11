@@ -43,7 +43,9 @@ import org.apache.iceberg.flink.CatalogLoader;
 import org.apache.iceberg.flink.FlinkWriteConf;
 import org.apache.iceberg.flink.SimpleDataUtil;
 import org.apache.iceberg.flink.TableLoader;
+import org.apache.iceberg.flink.data.EnrichedTableIdentifier;
 import org.apache.iceberg.flink.data.TableAwareWriteResult;
+import org.apache.iceberg.flink.data.TableIdentifierProperties;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -120,9 +122,6 @@ public class TestIcebergMultiTableStreamWriter {
     payloadTableSinkProvider = Mockito.mock(PayloadTableSinkProvider.class);
     tableIdentifier1 = TableIdentifier.of("test_raw", table1.name());
     tableIdentifier2 = TableIdentifier.of("test_raw", table2.name());
-    Mockito.when(payloadTableSinkProvider.getOrCreateTable(Mockito.any()))
-        .thenReturn(tableIdentifier1)
-        .thenReturn(tableIdentifier2);
   }
 
   @After
@@ -137,12 +136,21 @@ public class TestIcebergMultiTableStreamWriter {
         createIcebergStreamWriter()) {
       Mockito.when(tableLoader.loadTable()).thenReturn(table1).thenReturn(table2);
 
-      Mockito.when(payloadTableSinkProvider.getOrCreateTable(Mockito.any()))
-          .thenReturn(tableIdentifier1)
-          .thenReturn(tableIdentifier1)
-          .thenReturn(tableIdentifier2)
-          .thenReturn(tableIdentifier1)
-          .thenReturn(tableIdentifier2);
+      Mockito.when(payloadTableSinkProvider.getTableIdentifier(Mockito.any()))
+              .thenReturn(tableIdentifier1)
+              .thenReturn(tableIdentifier1)
+              .thenReturn(tableIdentifier2)
+              .thenReturn(tableIdentifier1)
+              .thenReturn(tableIdentifier2);
+
+      TableIdentifierProperties tableIdentifierProperties = new TableIdentifierProperties();
+
+      Mockito.when(payloadTableSinkProvider.createOrRefreshTable(Mockito.any(), Mockito.any(), Mockito.any()))
+              .thenReturn(EnrichedTableIdentifier.of(tableIdentifier1, tableIdentifierProperties))
+              .thenReturn(EnrichedTableIdentifier.of(tableIdentifier1, tableIdentifierProperties))
+              .thenReturn(EnrichedTableIdentifier.of(tableIdentifier2, tableIdentifierProperties))
+              .thenReturn(EnrichedTableIdentifier.of(tableIdentifier1, tableIdentifierProperties))
+              .thenReturn(EnrichedTableIdentifier.of(tableIdentifier2, tableIdentifierProperties));
       testHarness.processElement(SimpleDataUtil.createRowData(1, "1.1"), 1);
       testHarness.processElement(SimpleDataUtil.createRowData(2, "1.2"), 1);
       testHarness.processElement(SimpleDataUtil.createRowData(3, "2.1"), 1);
@@ -219,10 +227,17 @@ public class TestIcebergMultiTableStreamWriter {
     try (OneInputStreamOperatorTestHarness<RowData, TableAwareWriteResult> testHarness =
         createIcebergStreamWriter()) {
       Mockito.when(tableLoader.loadTable()).thenReturn(table1).thenReturn(table2);
-      Mockito.when(payloadTableSinkProvider.getOrCreateTable(Mockito.any()))
-          .thenReturn(tableIdentifier1)
-          .thenReturn(tableIdentifier1)
-          .thenReturn(tableIdentifier2);
+      Mockito.when(payloadTableSinkProvider.getTableIdentifier(Mockito.any()))
+              .thenReturn(tableIdentifier1)
+              .thenReturn(tableIdentifier1)
+              .thenReturn(tableIdentifier2);
+
+      TableIdentifierProperties tableIdentifierProperties = new TableIdentifierProperties();
+
+      Mockito.when(payloadTableSinkProvider.createOrRefreshTable(Mockito.any(), Mockito.any(), Mockito.any()))
+              .thenReturn(EnrichedTableIdentifier.of(tableIdentifier1, tableIdentifierProperties))
+              .thenReturn(EnrichedTableIdentifier.of(tableIdentifier1, tableIdentifierProperties))
+              .thenReturn(EnrichedTableIdentifier.of(tableIdentifier2, tableIdentifierProperties));
       testHarness.processElement(SimpleDataUtil.createRowData(1, "1.1"), timestamp++);
       testHarness.processElement(SimpleDataUtil.createRowData(2, "1.2"), timestamp++);
       testHarness.processElement(SimpleDataUtil.createRowData(3, "2.1"), timestamp);
@@ -267,8 +282,13 @@ public class TestIcebergMultiTableStreamWriter {
 
     try (OneInputStreamOperatorTestHarness<RowData, TableAwareWriteResult> testHarness =
         createIcebergStreamWriter()) {
-      Mockito.when(payloadTableSinkProvider.getOrCreateTable(Mockito.any()))
-          .thenReturn(tableIdentifier1);
+      Mockito.when(payloadTableSinkProvider.getTableIdentifier(Mockito.any()))
+              .thenReturn(tableIdentifier1);
+
+      TableIdentifierProperties tableIdentifierProperties = new TableIdentifierProperties();
+
+      Mockito.when(payloadTableSinkProvider.createOrRefreshTable(Mockito.any(), Mockito.any(), Mockito.any()))
+              .thenReturn(EnrichedTableIdentifier.of(tableIdentifier1, tableIdentifierProperties));
       testHarness.processElement(SimpleDataUtil.createRowData(1, "1.1"), 1);
       // Still not emit the data file yet, because there is no checkpoint.
       Assert.assertEquals(0, testHarness.extractOutputValues().size());
@@ -282,10 +302,17 @@ public class TestIcebergMultiTableStreamWriter {
     try (OneInputStreamOperatorTestHarness<RowData, TableAwareWriteResult> testHarness =
         createIcebergStreamWriter()) {
       Mockito.when(tableLoader.loadTable()).thenReturn(table1).thenReturn(table2);
-      Mockito.when(payloadTableSinkProvider.getOrCreateTable(Mockito.any()))
+      Mockito.when(payloadTableSinkProvider.getTableIdentifier(Mockito.any()))
           .thenReturn(tableIdentifier1)
           .thenReturn(tableIdentifier1)
           .thenReturn(tableIdentifier2);
+
+      TableIdentifierProperties tableIdentifierProperties = new TableIdentifierProperties();
+
+      Mockito.when(payloadTableSinkProvider.createOrRefreshTable(Mockito.any(), Mockito.any(), Mockito.any()))
+              .thenReturn(EnrichedTableIdentifier.of(tableIdentifier1, tableIdentifierProperties))
+              .thenReturn(EnrichedTableIdentifier.of(tableIdentifier1, tableIdentifierProperties))
+              .thenReturn(EnrichedTableIdentifier.of(tableIdentifier2, tableIdentifierProperties));
       testHarness.processElement(SimpleDataUtil.createRowData(1, "1.1"), 1);
       testHarness.processElement(SimpleDataUtil.createRowData(2, "1.2"), 2);
       testHarness.processElement(SimpleDataUtil.createRowData(3, "2.1"), 2);
@@ -322,9 +349,15 @@ public class TestIcebergMultiTableStreamWriter {
     try (OneInputStreamOperatorTestHarness<RowData, TableAwareWriteResult> testHarness =
         createIcebergStreamWriter()) {
       Mockito.when(tableLoader.loadTable()).thenReturn(table1).thenReturn(table2);
-      Mockito.when(payloadTableSinkProvider.getOrCreateTable(Mockito.any()))
-          .thenReturn(tableIdentifier1)
-          .thenReturn(tableIdentifier2);
+      Mockito.when(payloadTableSinkProvider.getTableIdentifier(Mockito.any()))
+              .thenReturn(tableIdentifier1)
+              .thenReturn(tableIdentifier2);
+
+      TableIdentifierProperties tableIdentifierProperties = new TableIdentifierProperties();
+
+      Mockito.when(payloadTableSinkProvider.createOrRefreshTable(Mockito.any(), Mockito.any(), Mockito.any()))
+              .thenReturn(EnrichedTableIdentifier.of(tableIdentifier1, tableIdentifierProperties))
+              .thenReturn(EnrichedTableIdentifier.of(tableIdentifier2, tableIdentifierProperties));
       testHarness.processElement(SimpleDataUtil.createRowData(1, "1.1"), 1);
       testHarness.processElement(SimpleDataUtil.createRowData(2, "2.1"), 2);
 

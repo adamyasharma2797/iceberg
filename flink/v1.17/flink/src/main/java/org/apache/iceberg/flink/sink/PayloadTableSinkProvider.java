@@ -20,7 +20,14 @@ package org.apache.iceberg.flink.sink;
 
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.flink.data.EnrichedTableIdentifier;
+import org.apache.iceberg.flink.data.TableIdentifierProperties;
+
+import java.util.Optional;
 
 public interface PayloadTableSinkProvider<T> {
-  TableIdentifier getOrCreateTable(StreamRecord<T> record);
+  TableIdentifier getTableIdentifier(StreamRecord<T> record);
+  EnrichedTableIdentifier createOrRefreshTable(TableIdentifier tableIdentifier,
+                                               Optional<TableIdentifierProperties> currentProps,
+                                               StreamRecord<T> record);
 }

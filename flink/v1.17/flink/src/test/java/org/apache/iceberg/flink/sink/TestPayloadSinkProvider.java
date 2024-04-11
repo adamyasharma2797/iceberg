@@ -21,14 +21,26 @@ package org.apache.iceberg.flink.sink;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.table.data.RowData;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.flink.data.EnrichedTableIdentifier;
+import org.apache.iceberg.flink.data.TableIdentifierProperties;
+
+import java.util.Optional;
 
 public class TestPayloadSinkProvider implements PayloadTableSinkProvider<RowData> {
 
   @Override
-  public TableIdentifier getOrCreateTable(StreamRecord<RowData> record) {
+  public TableIdentifier getTableIdentifier(StreamRecord<RowData> record) {
     RowData value = record.getValue();
     String identifier = value.getString(1).toString().split("\\.")[0];
     return TableIdentifier.of(sinkDatabaseName(), baseTable() + "_" + identifier);
+  }
+
+  @Override
+  public EnrichedTableIdentifier createOrRefreshTable(TableIdentifier tableIdentifier,
+                                                      Optional<TableIdentifierProperties> currentProps,
+                                                      StreamRecord<RowData> record) {
+    // Do not change any properties and identifier
+    return EnrichedTableIdentifier.of(tableIdentifier, currentProps.orElse(new TableIdentifierProperties()));
   }
 
   private String sinkDatabaseName() {

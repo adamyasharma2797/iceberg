@@ -22,6 +22,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Objects;
 import org.apache.flink.table.data.ArrayData;
 import org.apache.flink.table.data.DecimalData;
 import org.apache.flink.table.data.MapData;
@@ -49,8 +50,12 @@ import org.apache.parquet.schema.LogicalTypeAnnotation.DecimalLogicalTypeAnnotat
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.PrimitiveType;
 import org.apache.parquet.schema.Type;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class FlinkParquetWriters {
+  private static final Logger LOG = LoggerFactory.getLogger(FlinkParquetWriters.class);
+
   private FlinkParquetWriters() {}
 
   @SuppressWarnings("unchecked")
@@ -498,6 +503,11 @@ public class FlinkParquetWriters {
 
     @Override
     protected Object get(RowData struct, int index) {
+      if(Objects.isNull(struct) || index >= struct.getArity()) {
+        LOG.warn("[FlinkParquetWriter]: Putting value as NULL for index: {} because struct has fewer elements: {}",
+                index, Objects.isNull(struct) ? 0 : struct.getArity());
+        return null;
+      }
       return fieldGetter[index].getFieldOrNull(struct);
     }
   }

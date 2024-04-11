@@ -23,6 +23,8 @@ import java.io.Serializable;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -43,6 +45,8 @@ import org.apache.iceberg.flink.MiniClusterResource;
 import org.apache.iceberg.flink.SimpleDataUtil;
 import org.apache.iceberg.flink.TableLoader;
 import org.apache.iceberg.flink.TestFixtures;
+import org.apache.iceberg.flink.data.EnrichedTableIdentifier;
+import org.apache.iceberg.flink.data.TableIdentifierProperties;
 import org.apache.iceberg.flink.util.FlinkCompatibilityUtil;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -212,6 +216,33 @@ public class TestFlinkIcebergSink extends TestFlinkIcebergSinkBase {
             .table(table)
             .readMultitableWriter(true)
             .setPayloadTableSinkProvider(new ComplexProvider())
+            .setCatalogLoader(catalogResource.catalogLoader())
+            .tableLoader(tableLoader)
+            .writeParallelism(parallelism)
+            .distributionMode(DistributionMode.NONE)
+            .append();
+
+    // Execute the program.
+    env.execute("Test Iceberg DataStream");
+
+    // Assert the iceberg table's records.
+    SimpleDataUtil.assertTableRows(table, convertToRowData(even));
+    SimpleDataUtil.assertTableRows(table1, convertToRowData(odd));
+  }
+
+  @Test
+  public void testMultiTableWriteRowDataOnMultiTableWithAlteringProps() throws Exception {
+    List<Row> rows = Lists.newArrayList(Row.of(1, "hello"), Row.of(2, "world"), Row.of(3, "foo"));
+    List<Row> odd = Lists.newArrayList(Row.of(1, "hello"), Row.of(3, "foo"));
+    List<Row> even = Lists.newArrayList(Row.of(2, "world"));
+    DataStream<RowData> dataStream =
+            env.addSource(createBoundedSource(rows), ROW_TYPE_INFO)
+                    .map(CONVERTER::toInternal, FlinkCompatibilityUtil.toTypeInfo(SimpleDataUtil.ROW_TYPE));
+
+    FlinkSink.forRowData(dataStream)
+            .table(table)
+            .readMultitableWriter(true)
+            .setPayloadTableSinkProvider(new OddEvenWithPropsAlteringProvider())
             .setCatalogLoader(catalogResource.catalogLoader())
             .tableLoader(tableLoader)
             .writeParallelism(parallelism)
@@ -502,20 +533,77 @@ public class TestFlinkIcebergSink extends TestFlinkIcebergSinkBase {
 
   private static class SimpleProvider implements PayloadTableSinkProvider<RowData>, Serializable {
     @Override
-    public TableIdentifier getOrCreateTable(StreamRecord<RowData> record) {
+    public TableIdentifier getTableIdentifier(StreamRecord<RowData> record) {
       return TABLE_IDENTIFIER;
+    }
+
+    @Override
+    public EnrichedTableIdentifier createOrRefreshTable(TableIdentifier tableIdentifier,
+                                                        Optional<TableIdentifierProperties> currentProps,
+                                                        StreamRecord<RowData> record) {
+      return currentProps.map(tableIdentifierProperties ->
+              EnrichedTableIdentifier.of(TABLE_IDENTIFIER, tableIdentifierProperties))
+              .orElseGet(() -> EnrichedTableIdentifier.of(TABLE_IDENTIFIER,
+                      new TableIdentifierProperties()));
     }
   }
 
 
   private static class ComplexProvider implements PayloadTableSinkProvider<RowData>, Serializable {
     @Override
-    public TableIdentifier getOrCreateTable(StreamRecord<RowData> record) {
+    public TableIdentifier getTableIdentifier(StreamRecord<RowData> record) {
       int val = record.getValue().getInt(0);
-      if (val %2 == 0) {
+      if (val%2 == 0) {
         return TABLE_IDENTIFIER;
       }
       return SECONDARY_TABLE_IDENTIFIER;
+    }
+
+    @Override
+    public EnrichedTableIdentifier createOrRefreshTable(TableIdentifier tableIdentifier,
+                                                        Optional<TableIdentifierProperties> currentProps,
+                                                        StreamRecord<RowData> record) {
+      if(!currentProps.isPresent()) {
+        TableIdentifierProperties props = new TableIdentifierProperties();
+        props.put("testKey", "oldVal");
+        return EnrichedTableIdentifier.of(tableIdentifier, props);
+      }
+      int val = record.getValue().getInt(0);
+      if (val%2 == 0) {
+        return EnrichedTableIdentifier.of(tableIdentifier, currentProps.get());
+      }
+      TableIdentifierProperties newProps = new TableIdentifierProperties();
+      newProps.put("testKey", "oldVal");
+      return EnrichedTableIdentifier.of(tableIdentifier, newProps);
+    }
+  }
+
+  private static class OddEvenWithPropsAlteringProvider implements PayloadTableSinkProvider<RowData>, Serializable {
+    @Override
+    public TableIdentifier getTableIdentifier(StreamRecord<RowData> record) {
+      int val = record.getValue().getInt(0);
+      if (val%2 == 0) {
+        return TABLE_IDENTIFIER;
+      }
+      return SECONDARY_TABLE_IDENTIFIER;
+    }
+
+    @Override
+    public EnrichedTableIdentifier createOrRefreshTable(TableIdentifier tableIdentifier,
+                                                        Optional<TableIdentifierProperties> currentProps,
+                                                        StreamRecord<RowData> record) {
+      if(!currentProps.isPresent()) {
+        TableIdentifierProperties props = new TableIdentifierProperties();
+        props.put("testKey", "oldVal");
+        return EnrichedTableIdentifier.of(tableIdentifier, props);
+      }
+      int val = record.getValue().getInt(0);
+      if (val%2 == 0) {
+        return EnrichedTableIdentifier.of(tableIdentifier, currentProps.get());
+      }
+      TableIdentifierProperties newProps = new TableIdentifierProperties();
+      newProps.put("testKey", "newVal");
+      return EnrichedTableIdentifier.of(tableIdentifier, newProps);
     }
   }
 }

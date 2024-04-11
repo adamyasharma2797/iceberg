@@ -18,12 +18,7 @@
  */
 package org.apache.iceberg.flink.sink;
 
-import java.io.IOException;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
+import org.apache.commons.collections.MapUtils;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
@@ -35,11 +30,21 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.flink.CatalogLoader;
 import org.apache.iceberg.flink.FlinkWriteConf;
 import org.apache.iceberg.flink.TableLoader;
+import org.apache.iceberg.flink.data.EnrichedTableIdentifier;
 import org.apache.iceberg.flink.data.TableAwareWriteResult;
+import org.apache.iceberg.flink.data.TableIdentifierProperties;
 import org.apache.iceberg.io.TaskWriter;
 import org.apache.iceberg.io.WriteResult;
 import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+
+import java.io.IOException;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 class IcebergMultiTableStreamWriter<T> extends AbstractStreamOperator<TableAwareWriteResult>
     implements OneInputStreamOperator<T, TableAwareWriteResult>, BoundedOneInput {
@@ -56,6 +61,7 @@ class IcebergMultiTableStreamWriter<T> extends AbstractStreamOperator<TableAware
   private transient int subTaskId;
   private transient int attemptId;
   private transient Map<TableIdentifier, IcebergStreamWriterMetrics> writerMetrics;
+  private transient Map<TableIdentifier, TableIdentifierProperties> tableIdentifierProperties;
 
   IcebergMultiTableStreamWriter(
       PayloadTableSinkProvider<T> payloadTableSinkProvider,
@@ -78,6 +84,7 @@ class IcebergMultiTableStreamWriter<T> extends AbstractStreamOperator<TableAware
     this.writers = Maps.newHashMap();
     this.writerMetrics = Maps.newHashMap();
     this.taskWriterFactories = Maps.newHashMap();
+    this.tableIdentifierProperties = Maps.newHashMap();
   }
 
   @Override
@@ -87,9 +94,17 @@ class IcebergMultiTableStreamWriter<T> extends AbstractStreamOperator<TableAware
 
   @Override
   public void processElement(StreamRecord<T> element) throws Exception {
-    TableIdentifier tableIdentifier = payloadTableSinkProvider.getOrCreateTable(element);
-    initializeTableIfRequired(tableIdentifier);
-    writers.get(tableIdentifier).write(element.getValue());
+    TableIdentifier tableIdentifier = payloadTableSinkProvider.getTableIdentifier(element);
+    LOG.debug("[IcebergMultiTableStreamWriter] Got Table Identifier: {}", tableIdentifier.toString());
+    EnrichedTableIdentifier enrichedTableIdentifier = getEnrichedTableIdentifier(tableIdentifier, element);
+    initializeOrRefreshTable(enrichedTableIdentifier);
+    LOG.debug("[IcebergMultiTableStreamWriter] Initialized EnrichedTableIdentifier: {}", enrichedTableIdentifier.toString());
+    try {
+      writers.get(tableIdentifier).write(element.getValue());
+    } catch (Exception e) {
+      LOG.error("Error occurred while writing the payload {}: ", element.getValue().toString(), e);
+      throw new RuntimeException(e);
+    }
   }
 
   @Override
@@ -135,19 +150,51 @@ class IcebergMultiTableStreamWriter<T> extends AbstractStreamOperator<TableAware
         .toString();
   }
 
-  private void initializeTableIfRequired(TableIdentifier tableIdentifier) {
-    LOG.info("checking if writer exists: {}", tableIdentifier.toString());
-    if (!writers.containsKey(tableIdentifier)) {
-      String tableName = tableIdentifier.name();
-      LOG.info("Writer not found for table: {}", tableName);
-      if (!taskWriterFactories.containsKey(tableIdentifier)) {
-        LOG.info("Task Writer Factory not found for table: {}", tableName);
-        TableLoader tableLoader = TableLoader.fromCatalog(catalogLoader, tableIdentifier);
-        tableLoader.open();
-        Table sinkTable = tableLoader.loadTable();
-        FlinkWriteConf flinkWriteConf = new FlinkWriteConf(sinkTable, writeOptions, readableConfig);
-        TaskWriterFactory taskWriterFactory =
-            new RowDataTaskWriterFactory(
+  private EnrichedTableIdentifier getEnrichedTableIdentifier(TableIdentifier tableIdentifier, StreamRecord<T> element)
+    throws IOException {
+    EnrichedTableIdentifier enrichedTableIdentifier = null;
+    if(MapUtils.isNotEmpty(tableIdentifierProperties) && tableIdentifierProperties.containsKey(tableIdentifier)) {
+      enrichedTableIdentifier = payloadTableSinkProvider.createOrRefreshTable(tableIdentifier,
+              Optional.of(tableIdentifierProperties.get(tableIdentifier)), element);
+    } else {
+      enrichedTableIdentifier = payloadTableSinkProvider.createOrRefreshTable(tableIdentifier,
+              Optional.empty(), element);
+    }
+
+    return enrichedTableIdentifier;
+  }
+
+  private void initializeOrRefreshTable(EnrichedTableIdentifier enrichedTableIdentifier) throws IOException {
+    LOG.debug("checking if writer does not exist or needs to be updated: {}", enrichedTableIdentifier.toString());
+
+    /**
+     * Writer will be upserted only if:
+     *  Either writer did not exist for this table identifier
+     *  Or Properties map is empty
+     *  Or Properties do not exist for this table identifier
+     *  Or Properties exist for the table identifier but enriched table identifier properties are different
+     */
+    if (!writers.containsKey(enrichedTableIdentifier.getTableIdentifier()) ||
+            MapUtils.isEmpty(tableIdentifierProperties) ||
+            !tableIdentifierProperties.containsKey(enrichedTableIdentifier.getTableIdentifier()) ||
+            !tableIdentifierProperties.get(enrichedTableIdentifier.getTableIdentifier())
+                    .equals(enrichedTableIdentifier.getTableIdentifierProperties())) {
+      String tableName = enrichedTableIdentifier.getTableIdentifier().name();
+
+      LOG.info("Writer needs to be upserted for table: {}", tableName);
+
+      if(MapUtils.isNotEmpty(writers) && writers.containsKey(enrichedTableIdentifier.getTableIdentifier())) {
+        LOG.info("Flushing old writer for table: {}", enrichedTableIdentifier.getTableIdentifier().name());
+        flushWriter(enrichedTableIdentifier.getTableIdentifier(), writers.get(enrichedTableIdentifier.getTableIdentifier()));
+      }
+
+      TableLoader tableLoader = TableLoader.fromCatalog(catalogLoader, enrichedTableIdentifier.getTableIdentifier());
+      tableLoader.open();
+      Table sinkTable = tableLoader.loadTable();
+      FlinkWriteConf flinkWriteConf = new FlinkWriteConf(sinkTable, writeOptions, readableConfig);
+
+      TaskWriterFactory taskWriterFactory =
+              new RowDataTaskWriterFactory(
                 sinkTable,
                 FlinkSink.toFlinkRowType(sinkTable.schema(), null),
                 flinkWriteConf.targetDataFileSize(),
@@ -156,14 +203,18 @@ class IcebergMultiTableStreamWriter<T> extends AbstractStreamOperator<TableAware
                     sinkTable, flinkWriteConf.dataFileFormat(), flinkWriteConf),
                 TablePropertyUtil.checkAndGetEqualityFieldIds(sinkTable, equalityFieldColumns),
                 flinkWriteConf.upsertMode());
-        taskWriterFactory.initialize(subTaskId, attemptId);
-        taskWriterFactories.put(tableIdentifier, taskWriterFactory);
-      }
-      TaskWriter<T> taskWriter = taskWriterFactories.get(tableIdentifier).create();
-      writers.put(tableIdentifier, taskWriter);
+
+      taskWriterFactory.initialize(subTaskId, attemptId);
+      taskWriterFactories.put(enrichedTableIdentifier.getTableIdentifier(), taskWriterFactory);
+      TaskWriter<T> taskWriter = taskWriterFactories.get(enrichedTableIdentifier.getTableIdentifier()).create();
+      writers.put(enrichedTableIdentifier.getTableIdentifier(), taskWriter);
+      tableIdentifierProperties.put(enrichedTableIdentifier.getTableIdentifier(),
+              enrichedTableIdentifier.getTableIdentifierProperties());
       IcebergStreamWriterMetrics tableWriteMetrics =
           new IcebergStreamWriterMetrics(super.metrics, tableName);
-      writerMetrics.put(tableIdentifier, tableWriteMetrics);
+      writerMetrics.put(enrichedTableIdentifier.getTableIdentifier(), tableWriteMetrics);
+
+      LOG.info("Putting writer with key: {}", enrichedTableIdentifier.getTableIdentifier().toString());
     }
   }
 
@@ -172,22 +223,27 @@ class IcebergMultiTableStreamWriter<T> extends AbstractStreamOperator<TableAware
     if (writers.isEmpty()) {
       return;
     }
+
     Iterator<Map.Entry<TableIdentifier, TaskWriter<T>>> iterator = writers.entrySet().iterator();
     while (iterator.hasNext()) {
-      long startNano = System.nanoTime();
       Map.Entry<TableIdentifier, TaskWriter<T>> writerMap = iterator.next();
       TableIdentifier tableIdentifier = writerMap.getKey();
       TaskWriter<T> writer = writerMap.getValue();
-      WriteResult result = writer.complete();
-      TableAwareWriteResult tableAwareWriteResult =
-          new TableAwareWriteResult(result, tableIdentifier);
-      IcebergStreamWriterMetrics metrics = writerMetrics.get(tableIdentifier);
-      output.collect(new StreamRecord<>(tableAwareWriteResult));
-      metrics.flushDuration(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNano));
+      flushWriter(tableIdentifier, writer);
     }
 
     // Set writer to null to prevent duplicate flushes in the corner case of
     // prepareSnapshotPreBarrier happening after endInput.
     writers.clear();
+  }
+
+  private void flushWriter(TableIdentifier tableIdentifier, TaskWriter<T> writer) throws IOException {
+    long startNano = System.nanoTime();
+    WriteResult result = writer.complete();
+    TableAwareWriteResult tableAwareWriteResult =
+            new TableAwareWriteResult(result, tableIdentifier);
+    IcebergStreamWriterMetrics metrics = writerMetrics.get(tableIdentifier);
+    output.collect(new StreamRecord<>(tableAwareWriteResult));
+    metrics.flushDuration(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNano));
   }
 }
