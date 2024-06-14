@@ -646,6 +646,9 @@ class IcebergMultiTableFilesCommitter extends AbstractStreamOperator<Void>
       return EMPTY_MANIFEST_DATA;
     }
     List<WriteResult> writeResults = writeResultsOfCurrentCkpt.get(tableIdentifier);
+    if (Objects.isNull(writeResults)) {
+      return EMPTY_MANIFEST_DATA;
+    }
 
     WriteResult result = WriteResult.builder().addAll(writeResults).build();
     DeltaManifests deltaManifests =
