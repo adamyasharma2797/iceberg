@@ -18,7 +18,6 @@
  */
 package org.apache.iceberg.hive;
 
-import static org.apache.iceberg.TableProperties.CURRENT_SNAPSHOT_ID;
 import static org.apache.iceberg.TableProperties.GC_ENABLED;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -457,14 +456,14 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
 
   @VisibleForTesting
   void setSnapshotStats(TableMetadata metadata, Map<String, String> parameters) {
-    parameters.remove(CURRENT_SNAPSHOT_ID);
+    parameters.remove(TableProperties.CURRENT_SNAPSHOT_ID);
     parameters.remove(TableProperties.CURRENT_SNAPSHOT_TIMESTAMP);
     parameters.remove(TableProperties.CURRENT_SNAPSHOT_SUMMARY);
 
     Snapshot currentSnapshot = metadata.currentSnapshot();
     if (exposeInHmsProperties() && currentSnapshot != null) {
-      parameters.put(
-          CURRENT_SNAPSHOT_ID, String.valueOf(currentSnapshot.snapshotId()));
+      parameters.put(TableProperties.CURRENT_SNAPSHOT_ID,
+              String.valueOf(currentSnapshot.snapshotId()));
       parameters.put(
           TableProperties.CURRENT_SNAPSHOT_TIMESTAMP,
           String.valueOf(currentSnapshot.timestampMillis()));
