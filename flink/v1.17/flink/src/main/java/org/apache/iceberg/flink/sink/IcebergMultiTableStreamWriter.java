@@ -20,6 +20,7 @@ package org.apache.iceberg.flink.sink;
 
 import org.apache.commons.collections.MapUtils;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
 import org.apache.flink.streaming.api.operators.ChainingStrategy;
@@ -62,6 +63,7 @@ class IcebergMultiTableStreamWriter<T> extends AbstractStreamOperator<TableAware
   private transient int attemptId;
   private transient Map<TableIdentifier, IcebergStreamWriterMetrics> writerMetrics;
   private transient Map<TableIdentifier, TableIdentifierProperties> tableIdentifierProperties;
+  private transient int currentElemCnt = 0;
 
   IcebergMultiTableStreamWriter(
       PayloadTableSinkProvider<T> payloadTableSinkProvider,
@@ -89,11 +91,20 @@ class IcebergMultiTableStreamWriter<T> extends AbstractStreamOperator<TableAware
 
   @Override
   public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
+    LOG.info("[DEBUG-IcebergMultiTableStreamWriter]Got {} elements in checkpoint : {}", currentElemCnt, checkpointId);
+  }
+
+  @Override
+  public void snapshotState(StateSnapshotContext context) throws Exception {
+    LOG.info("[DEBUG-IcebergMultiTableStreamWriter] snapshotState Got {} elements", currentElemCnt);
+    super.snapshotState(context);
     flush();
+    currentElemCnt = 0;
   }
 
   @Override
   public void processElement(StreamRecord<T> element) throws Exception {
+    ++currentElemCnt;
     TableIdentifier tableIdentifier = payloadTableSinkProvider.getTableIdentifier(element);
     LOG.debug("[IcebergMultiTableStreamWriter] Got Table Identifier: {}", tableIdentifier.toString());
     EnrichedTableIdentifier enrichedTableIdentifier = getEnrichedTableIdentifier(tableIdentifier, element);
@@ -102,6 +113,7 @@ class IcebergMultiTableStreamWriter<T> extends AbstractStreamOperator<TableAware
     try {
       writers.get(tableIdentifier).write(element.getValue());
     } catch (Exception e) {
+      --currentElemCnt;
       LOG.error("Error occurred while writing the payload {}: ", element.getValue().toString(), e);
       throw new RuntimeException(e);
     }

@@ -43,8 +43,12 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.util.JsonUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class TableMetadataParser {
+
+  private static final Logger LOG = LoggerFactory.getLogger(TableMetadataParser.class);
 
   public enum Codec {
     NONE(""),
@@ -124,10 +128,14 @@ public class TableMetadataParser {
     OutputStream stream = overwrite ? outputFile.createOrOverwrite() : outputFile.create();
     try (OutputStream ou = isGzip ? new GZIPOutputStream(stream) : stream;
         OutputStreamWriter writer = new OutputStreamWriter(ou, StandardCharsets.UTF_8)) {
+      LOG.info("[TEMP-DEBUG] Starting to generate JSON for: {}", outputFile.location());
       JsonGenerator generator = JsonUtil.factory().createGenerator(writer);
+      LOG.info("[TEMP-DEBUG] generator created for: {}", outputFile.location());
       generator.useDefaultPrettyPrinter();
       toJson(metadata, generator);
+      LOG.info("[TEMP-DEBUG] toJson done for: {}", outputFile.location());
       generator.flush();
+      LOG.info("[TEMP-DEBUG] Flushed JSON for: {}", outputFile.location());
     } catch (IOException e) {
       throw new RuntimeIOException(e, "Failed to write json to file: %s", outputFile);
     }

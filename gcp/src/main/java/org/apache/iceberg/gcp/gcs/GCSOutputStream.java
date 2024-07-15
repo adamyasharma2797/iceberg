@@ -62,6 +62,8 @@ class GCSOutputStream extends PositionOutputStream {
   GCSOutputStream(
       Storage storage, BlobId blobId, GCPProperties gcpProperties, MetricsContext metrics)
       throws IOException {
+    LOG.info("[TEMP-DEBUG] GCSOutputStream creation called for: gen:{}, bkt:{}, nm:{}    lobId: {}",
+            blobId.getGeneration(), blobId.getBucket(), blobId.getName(), blobId);
     this.storage = storage;
     this.blobId = blobId;
     this.gcpProperties = gcpProperties;
@@ -71,7 +73,13 @@ class GCSOutputStream extends PositionOutputStream {
     this.writeBytes = metrics.counter(FileIOMetricsContext.WRITE_BYTES, Unit.BYTES);
     this.writeOperations = metrics.counter(FileIOMetricsContext.WRITE_OPERATIONS);
 
+    LOG.info("[TEMP-DEBUG] About to openStream for GCSOutputStream creation called for: gen:{}, bkt:{}, nm:{}, blobId: {}",
+            blobId.getGeneration(), blobId.getBucket(), blobId.getName(), blobId);
+
     openStream();
+
+    LOG.info("[TEMP-DEBUG] Stream created for GCSOutputStream creation called for: gen:{}, bkt:{}, nm:{}, blobId: {}",
+            blobId.getGeneration(), blobId.getBucket(), blobId.getName(), blobId);
   }
 
   @Override
@@ -81,26 +89,47 @@ class GCSOutputStream extends PositionOutputStream {
 
   @Override
   public void flush() throws IOException {
+
+    LOG.info("[TEMP-DEBUG] flush() called for: gen:{}, bkt:{}, nm:{}, blobId: {}",
+            blobId.getGeneration(), blobId.getBucket(), blobId.getName(), blobId);
     stream.flush();
+
+    LOG.info("[TEMP-DEBUG] flush() done for: gen:{}, bkt:{}, nm:{}, blobId: {}",
+            blobId.getGeneration(), blobId.getBucket(), blobId.getName(), blobId);
   }
 
   @Override
   public void write(int b) throws IOException {
+
+    LOG.info("[TEMP-DEBUG] write() called for: gen:{}, bkt:{}, nm:{}, blobId: {}",
+            blobId.getGeneration(), blobId.getBucket(), blobId.getName(), blobId);
     stream.write(b);
     pos += 1;
     writeBytes.increment();
     writeOperations.increment();
+
+    LOG.info("[TEMP-DEBUG] write() done for: gen:{}, bkt:{}, nm:{}, blobId: {}",
+            blobId.getGeneration(), blobId.getBucket(), blobId.getName(), blobId);
   }
 
   @Override
   public void write(byte[] b, int off, int len) throws IOException {
+
+    LOG.info("[TEMP-DEBUG] write2() called for: gen:{}, bkt:{}, nm:{}, blobId: {}",
+            blobId.getGeneration(), blobId.getBucket(), blobId.getName(), blobId);
     stream.write(b, off, len);
     pos += len;
     writeBytes.increment(len);
     writeOperations.increment();
+
+    LOG.info("[TEMP-DEBUG] write2() done for: gen:{}, bkt:{}, nm:{}, blobId: {}",
+            blobId.getGeneration(), blobId.getBucket(), blobId.getName(), blobId);
   }
 
   private void openStream() {
+
+    LOG.info("[TEMP-DEBUG] openStream() called for: gen:{}, bkt:{}, nm:{}, blobId: {}",
+            blobId.getGeneration(), blobId.getBucket(), blobId.getName(), blobId);
     List<BlobWriteOption> writeOptions = Lists.newArrayList();
 
     gcpProperties
@@ -117,10 +146,16 @@ class GCSOutputStream extends PositionOutputStream {
     gcpProperties.channelWriteChunkSize().ifPresent(channel::setChunkSize);
 
     stream = Channels.newOutputStream(channel);
+
+    LOG.info("[TEMP-DEBUG] openStream() done for: gen:{}, bkt:{}, nm:{}, blobId: {}",
+            blobId.getGeneration(), blobId.getBucket(), blobId.getName(), blobId);
   }
 
   @Override
   public void close() throws IOException {
+
+    LOG.info("[TEMP-DEBUG] close() called for: gen:{}, bkt:{}, nm:{}, blobId: {}",
+            blobId.getGeneration(), blobId.getBucket(), blobId.getName(), blobId);
     if (closed) {
       return;
     }
@@ -128,16 +163,25 @@ class GCSOutputStream extends PositionOutputStream {
     super.close();
     closed = true;
     stream.close();
+
+    LOG.info("[TEMP-DEBUG] close() done for: gen:{}, bkt:{}, nm:{}, blobId: {}",
+            blobId.getGeneration(), blobId.getBucket(), blobId.getName(), blobId);
   }
 
   @SuppressWarnings("checkstyle:NoFinalizer")
   @Override
   protected void finalize() throws Throwable {
+
+    LOG.info("[TEMP-DEBUG] finalize() called for: gen:{}, bkt:{}, nm:{}, blobId: {}",
+            blobId.getGeneration(), blobId.getBucket(), blobId.getName(), blobId);
     super.finalize();
     if (!closed) {
       close(); // releasing resources is more important than printing the warning
       String trace = Joiner.on("\n\t").join(Arrays.copyOfRange(createStack, 1, createStack.length));
       LOG.warn("Unclosed output stream created by:\n\t{}", trace);
     }
+
+    LOG.info("[TEMP-DEBUG] finalize() done for: gen:{}, bkt:{}, nm:{}, blobId: {}",
+            blobId.getGeneration(), blobId.getBucket(), blobId.getName(), blobId);
   }
 }

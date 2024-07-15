@@ -28,8 +28,12 @@ import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.io.PositionOutputStream;
 import org.apache.iceberg.metrics.MetricsContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 class GCSOutputFile extends BaseGCSFile implements OutputFile {
+
+  private static final Logger LOG = LoggerFactory.getLogger(GCSOutputFile.class);
 
   static GCSOutputFile fromLocation(
       String location, Storage storage, GCPProperties gcpProperties, MetricsContext metrics) {
@@ -49,6 +53,8 @@ class GCSOutputFile extends BaseGCSFile implements OutputFile {
    */
   @Override
   public PositionOutputStream create() {
+    LOG.info("[TEMP-DEBUG] create() called for: gen:{}, bkt:{}, nm:{}, blobId: {}",
+            blobId().getGeneration(), blobId().getBucket(), blobId().getName(), blobId());
     if (!exists()) {
       return createOrOverwrite();
     } else {
@@ -58,6 +64,8 @@ class GCSOutputFile extends BaseGCSFile implements OutputFile {
 
   @Override
   public PositionOutputStream createOrOverwrite() {
+    LOG.info("[TEMP-DEBUG] createOrOverwrite() called for: gen:{}, bkt:{}, nm:{}, blobId: {}",
+            blobId().getGeneration(), blobId().getBucket(), blobId().getName(), blobId());
     try {
       return new GCSOutputStream(storage(), blobId(), gcpProperties(), metrics());
     } catch (IOException e) {
@@ -67,6 +75,8 @@ class GCSOutputFile extends BaseGCSFile implements OutputFile {
 
   @Override
   public InputFile toInputFile() {
+    LOG.info("[TEMP-DEBUG] toInputFile() called for: gen:{}, bkt:{}, nm:{}, blobId: {}",
+            blobId().getGeneration(), blobId().getBucket(), blobId().getName(), blobId());
     return new GCSInputFile(storage(), blobId(), null, gcpProperties(), metrics());
   }
 }

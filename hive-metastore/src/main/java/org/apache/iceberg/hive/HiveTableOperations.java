@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.hive;
 
+import static org.apache.iceberg.TableProperties.CURRENT_SNAPSHOT_ID;
 import static org.apache.iceberg.TableProperties.GC_ENABLED;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -186,10 +187,14 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
     boolean hiveEngineEnabled = hiveEngineEnabled(metadata, conf);
     boolean keepHiveStats = conf.getBoolean(ConfigProperties.KEEP_HIVE_STATS, false);
 
+    LOG.info("Starting commit for {}.{}", database, tableName);
+
     CommitStatus commitStatus = CommitStatus.FAILURE;
     boolean updateHiveTable = false;
 
     HiveLock lock = lockObject(metadata);
+
+    LOG.info("Using lock : {} for commit of {}.{}", lock, database, tableName);
     try {
       lock.lock();
 
@@ -205,15 +210,17 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
         }
 
         updateHiveTable = true;
-        LOG.debug("Committing existing table: {}", fullName);
+        LOG.info("Committing existing table: {}", fullName);
       } else {
         tbl = newHmsTable(metadata);
-        LOG.debug("Committing new table: {}", fullName);
+        LOG.info("Committing new table: {}", fullName);
       }
 
       tbl.setSd(storageDescriptor(metadata, hiveEngineEnabled)); // set to pickup any schema changes
 
       String metadataLocation = tbl.getParameters().get(METADATA_LOCATION_PROP);
+      LOG.info("Got current metadataLocation: {}", metadataLocation);
+
       String baseMetadataLocation = base != null ? base.metadataFileLocation() : null;
       if (!Objects.equals(baseMetadataLocation, metadataLocation)) {
         throw new CommitFailedException(
@@ -247,6 +254,9 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
         persistTable(
             tbl, updateHiveTable, hiveLockEnabled(metadata, conf) ? null : baseMetadataLocation);
         lock.ensureActive();
+
+        LOG.info("Persisted table: {}, {}, expected metadata location: {}", tbl.toString(), tbl.getTableName(),
+                baseMetadataLocation);
 
         commitStatus = CommitStatus.SUCCESS;
       } catch (LockException le) {
@@ -447,14 +457,14 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
 
   @VisibleForTesting
   void setSnapshotStats(TableMetadata metadata, Map<String, String> parameters) {
-    parameters.remove(TableProperties.CURRENT_SNAPSHOT_ID);
+    parameters.remove(CURRENT_SNAPSHOT_ID);
     parameters.remove(TableProperties.CURRENT_SNAPSHOT_TIMESTAMP);
     parameters.remove(TableProperties.CURRENT_SNAPSHOT_SUMMARY);
 
     Snapshot currentSnapshot = metadata.currentSnapshot();
     if (exposeInHmsProperties() && currentSnapshot != null) {
       parameters.put(
-          TableProperties.CURRENT_SNAPSHOT_ID, String.valueOf(currentSnapshot.snapshotId()));
+          CURRENT_SNAPSHOT_ID, String.valueOf(currentSnapshot.snapshotId()));
       parameters.put(
           TableProperties.CURRENT_SNAPSHOT_TIMESTAMP,
           String.valueOf(currentSnapshot.timestampMillis()));

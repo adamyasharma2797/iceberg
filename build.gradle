@@ -947,7 +947,7 @@ boolean versionFileExists() {
 
 @Memoized
 String getVersionFromFile() {
-  return "1.4.3.fk.2.0-SNAPSHOT"
+  return "1.4.3.fk.2.0.1-SNAPSHOT"
 }
 
 String getProjectVersion() {
