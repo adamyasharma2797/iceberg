@@ -89,6 +89,8 @@ class IcebergMultiTableStreamWriter<T> extends AbstractStreamOperator<TableAware
 
   @Override
   public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
+    LOG.info("[DEBUG-IcebergMultiTableStreamWriter] Called prepareSnapshotPreBarrier iceberg for checkpoint : {}",
+            checkpointId);
     flush();
   }
 
