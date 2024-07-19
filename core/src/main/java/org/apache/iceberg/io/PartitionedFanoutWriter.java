@@ -24,9 +24,12 @@ import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.PartitionKey;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public abstract class PartitionedFanoutWriter<T> extends BaseTaskWriter<T> {
   private final Map<PartitionKey, RollingFileWriter> writers = Maps.newHashMap();
+  private static final Logger LOG = LoggerFactory.getLogger(PartitionedFanoutWriter.class);
 
   protected PartitionedFanoutWriter(
       PartitionSpec spec,
@@ -66,6 +69,8 @@ public abstract class PartitionedFanoutWriter<T> extends BaseTaskWriter<T> {
   @Override
   public void close() throws IOException {
     if (!writers.isEmpty()) {
+      LOG.info("Partition Writer Size: {}", writers.size());
+      LOG.info("Partition Writer Keys: {}", writers.keySet());
       for (PartitionKey key : writers.keySet()) {
         writers.get(key).close();
       }

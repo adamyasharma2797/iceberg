@@ -40,8 +40,11 @@ import org.apache.iceberg.util.StructLikeMap;
 import org.apache.iceberg.util.StructProjection;
 import org.apache.iceberg.util.Tasks;
 import org.apache.iceberg.util.ThreadPools;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
+  private static final Logger LOG = LoggerFactory.getLogger(BaseTaskWriter.class);
   private final List<DataFile> completedDataFiles = Lists.newArrayList();
   private final List<DeleteFile> completedDeleteFiles = Lists.newArrayList();
   private final CharSequenceSet referencedDataFiles = CharSequenceSet.empty();
@@ -278,6 +281,7 @@ public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
       this.currentRows++;
 
       if (shouldRollToNewFile()) {
+        LOG.info("Closing file: {} as it went beyond target size: {}", currentFile.encryptingOutputFile().location(), targetFileSize);
         closeCurrent();
         openCurrent();
       }
@@ -311,6 +315,7 @@ public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
     private void closeCurrent() throws IOException {
       if (currentWriter != null) {
         try {
+          LOG.info("Closing file: {}, File Size: {}, Row Count: {}, targetFileSize: {}", currentFile.encryptingOutputFile().location(), length(currentWriter), currentRows, targetFileSize);
           currentWriter.close();
 
           if (currentRows == 0L) {
