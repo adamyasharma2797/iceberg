@@ -281,7 +281,7 @@ public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
       this.currentRows++;
 
       if (shouldRollToNewFile()) {
-        LOG.info("Closing file as it went beyond target size: {}", targetFileSize);
+        LOG.info("Closing file: {} as it went beyond target size: {}", currentFile.encryptingOutputFile().location(), targetFileSize);
         closeCurrent();
         openCurrent();
       }
@@ -315,7 +315,7 @@ public abstract class BaseTaskWriter<T> implements TaskWriter<T> {
     private void closeCurrent() throws IOException {
       if (currentWriter != null) {
         try {
-          LOG.info("Closing file: File Size: {}, Row Count: {}, targetFileSize: {}", length(currentWriter), currentRows, targetFileSize);
+          LOG.info("Closing file: {}, File Size: {}, Row Count: {}, targetFileSize: {}", currentFile.encryptingOutputFile().location(), length(currentWriter), currentRows, targetFileSize);
           currentWriter.close();
 
           if (currentRows == 0L) {
